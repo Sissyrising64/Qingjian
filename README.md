@@ -220,6 +220,6 @@ AI-generated suggestions were reviewed and integrated by the maintainer. The pro
 
 ## License
 
-Qingjian is released under the [MIT License](LICENSE). Copyright © 2026 ZHENGFAN YANG.
+Qingjian is released under the [MIT License](LICENSE). Copyright © 2026 p1ziYu.
 
 Third-party dependencies remain under their respective licenses.
