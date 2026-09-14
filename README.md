@@ -2,6 +2,11 @@
 
 > A keyboard-first, local-first media sorter for quickly reviewing and organizing photos and videos on Windows.
 
+[![Latest release](https://img.shields.io/github/v/release/p1ziYu/Qingjian?display_name=tag&sort=semver)](https://github.com/p1ziYu/Qingjian/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D6)](https://github.com/p1ziYu/Qingjian)
+[![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB)](https://www.python.org/)
+[![Status](https://img.shields.io/badge/status-tested-2EA44F)](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.4)
+
 [English](#qingjian-轻拣) · [中文](#中文说明)
 
 ## Overview
@@ -9,6 +14,18 @@
 Qingjian helps you turn an unsorted media folder into an organized library with a fast review loop: preview one item, press a configured key, and continue to the next item. It supports images and videos, configurable destinations, safe file transactions, duplicate review, and a complete undo/recovery workflow.
 
 Version **2.0.4** is the current tested build. The 2.0.4 maintenance release restores the tested 2.0.3 visual baseline and fixes the startup state of the Undo and “Restore previous step” actions.
+
+## At a glance
+
+| | |
+| --- | --- |
+| **Product** | Qingjian / 轻拣 |
+| **Current release** | [v2.0.4](https://github.com/p1ziYu/Qingjian/releases/tag/v2.0.4) |
+| **Platform** | Windows 10/11 |
+| **Interface** | PySide6 desktop UI · English / 简体中文 |
+| **Media** | Photos, RAW files, videos, and sidecar metadata |
+| **Data model** | Local filesystem + SQLite state + durable transaction journal |
+| **Network** | Not required; media stays on the local machine |
 
 ## Highlights
 
@@ -56,6 +73,51 @@ python main.py --selfcheck
 ```
 
 The self-check creates a temporary library, exercises core operations, drives the real Qt window offscreen, opens the dialogs, switches languages and views, performs classify/undo, and verifies that a fresh window has both Undo and Restore Previous Step disabled. It does not touch user media.
+
+## Feature showcase
+
+### 1. Review, decide, continue
+
+Open a source folder, preview the current item, press a single configured key, and immediately continue. Single-item and grid views, search, filters, sorting, ratings, labels, and a review-later queue keep the workflow focused.
+
+### 2. Destinations that match your workflow
+
+Each binding can target a different folder and action. Path and filename templates support dates, metadata, the original name, and sequence numbers. When a destination already contains the same name, Qingjian asks whether to **Replace** or keep both with an automatic suffix.
+
+### 3. Duplicate review without destructive defaults
+
+Inspect exact duplicates, perceptual near-duplicates, and burst groups in a dedicated review flow. Double-clicking a result previews the actual media. **Ignore** writes a source-folder exclusion and never moves or deletes the file.
+
+### 4. Transactions you can undo
+
+Every mutating operation is journaled before file changes. The engine checks file identity, supports atomic same-volume moves, and can recover after interruption. `Ctrl+Z` undoes; `Ctrl+Y` restores the previous step. Both controls stay disabled until a source folder and applicable history exist.
+
+### 5. Sidecars move as one unit
+
+RAW, XMP, AAE, and Live Photo video sidecars can follow their primary media in one transaction. Renames and undo preserve the relationship instead of leaving metadata behind.
+
+### 6. Keyboard-first, bilingual desktop UI
+
+The interface is optimized for long review sessions: visible key bindings, clear enabled/disabled states, English/Chinese switching, and mouse access when needed.
+
+## How the pieces fit
+
+```text
+Source folder
+     │
+     ▼
+Scanner ── filters / sort / sidecar grouping ──► Review queue
+     │                                             │
+     ▼                                             ▼
+Metadata + duplicate index                    PySide6 UI
+     │                                             │
+     └──────────────► Transaction engine ◄─────────┘
+                         │
+                         ├─ journal + recovery store
+                         └─ SQLite state / ratings / labels / ignores
+```
+
+The `core` package is Qt-free and owns filesystem, metadata, duplicate, state, and transaction logic. The `ui` package renders the workflow and calls the engine rather than changing files directly.
 
 ## Keyboard shortcuts
 
@@ -124,6 +186,18 @@ qingjian.spec PyInstaller recipe
 ```
 
 The core layer does not import Qt. The UI calls the engine layer instead of manipulating filesystem operations directly.
+
+## Repository guide
+
+- `qingjian/core/` — Qt-free scanning, metadata, templates, transactions, state, and duplicate logic.
+- `qingjian/ui/` — PySide6 application, preview, dialogs, bindings, and duplicate review.
+- `tests/` — unit, integrity, media, and scale tests.
+- `功能修复说明.md` — 2.0.4 maintenance notes.
+- `打包测试报告.md` — build and verification report.
+
+## Contributing
+
+Bug reports and focused pull requests are welcome. Please include the Windows version, Python version (for source builds), reproduction steps, and the output of `python main.py --selfcheck`. Never attach personal media or application data directories; use synthetic files when possible.
 
 ## AI-assisted development disclosure
 
