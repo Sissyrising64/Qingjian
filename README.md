@@ -25,7 +25,7 @@ Version **2.0.4** is the current tested build. The 2.0.4 maintenance release res
 
 ## Download and run (Windows)
 
-1. Download the latest `轻拣2.0.4-已测试版.zip` from the repository Releases page.
+1. Download the latest `Qingjian-2.0.4-Windows.zip` from the repository Releases page.
 2. Extract the archive to a local folder.
 3. Run `MediaSorter.exe`.
 4. Select a source folder, configure the key bindings, and start reviewing.
