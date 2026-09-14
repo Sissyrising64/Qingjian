@@ -1,0 +1,67 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller recipe.
+
+Build with:
+    python -m PyInstaller --noconfirm qingjian.spec
+
+The executable is named MediaSorter.exe on purpose. The interface is still
+called 轻拣; a non-ASCII executable name reproduced a native-window crash on
+the delivery machine, so the file name stays ASCII.
+"""
+
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+multimedia = collect_all("PySide6.QtMultimedia")
+
+hidden = list(multimedia[2]) + [
+    "PySide6.QtMultimediaWidgets",
+    "send2trash",
+    "send2trash.win",
+]
+hidden += collect_submodules("qingjian")
+
+a = Analysis(
+    ["main.py"],
+    pathex=[],
+    binaries=list(multimedia[1]),
+    datas=list(multimedia[0]),
+    hiddenimports=hidden,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # Never wanted, and each one is tens of megabytes.
+        "tkinter", "matplotlib", "scipy", "cv2", "pandas", "hachoir",
+        "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
+        "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtQuick3D",
+        "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning",
+        "PySide6.QtSerialPort", "PySide6.QtTest", "PySide6.QtDesigner",
+    ],
+    noarchive=False,
+    # The self-check deliberately uses assertions for its own diagnostics;
+    # production file-safety checks raise explicit TransactionError values.
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="MediaSorter",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    hide_console="hide-early",
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)

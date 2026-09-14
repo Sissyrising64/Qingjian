@@ -1,0 +1,12 @@
+# Required
+PySide6==6.9.2
+Pillow>=12.0
+numpy>=1.26          # perceptual hashing and the sharpness measure
+
+# Recommended
+Send2Trash>=1.8      # the system recycle bin; without it recycling stays app-side
+av==17.1.0           # video thumbnails and frame-accurate stepping
+
+# hachoir is deliberately gone: durations now come from the container header
+# (qingjian/core/isobmff.py) or from PyAV, and carrying a second parser
+# framework only for that was costing build size for nothing.

@@ -1,0 +1,275 @@
+"""Persistent cache for content hashes, perceptual hashes and sharpness.
+
+Without it, every duplicate scan re-reads the whole library from disk. Keyed by
+path plus size plus mtime, so an edited file is recomputed and a merely moved
+one costs a single row.
+"""
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+from .logsetup import get_logger
+
+log = get_logger("hashcache")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+    path      TEXT PRIMARY KEY,
+    size      INTEGER NOT NULL,
+    mtime_ns  INTEGER NOT NULL,
+    sha256    TEXT,
+    phash     TEXT,
+    dhash     TEXT,
+    sharpness REAL,
+    captured  REAL,
+    updated   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS entries_size ON entries(size);
+CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+FIELDS = ("sha256", "phash", "dhash", "sharpness", "captured")
+
+
+class HashCache:
+    """Thread-safe key/value store. Losing it costs time, never correctness."""
+
+    def __init__(self, path: str | Path | None) -> None:
+        self.path = Path(path) if path else None
+        self._lock = threading.RLock()
+        self._memory: dict[tuple, dict] = {}
+        self._db: sqlite3.Connection | None = None
+        #: Depth of the current `batch`. Above zero, writes are not committed
+        #: one at a time: a duplicate scan stores a row per file, and a commit
+        #: each is a synchronous disk flush per photograph.
+        self._batching = 0
+        self._dirty = False
+        if self.path is not None:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+                self._db.executescript(SCHEMA)
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.commit()
+                self._migrate()
+            except sqlite3.Error as error:
+                log.warning("hash cache unavailable, running in memory: %s", error)
+                self._db = None
+
+    def _migrate(self) -> None:
+        """Add columns an older cache file lacks, and drop stale hashes."""
+        if self._db is None:
+            return
+        try:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(entries)")}
+            if "captured" not in columns:
+                self._db.execute("ALTER TABLE entries ADD COLUMN captured REAL")
+            row = self._db.execute(
+                "SELECT value FROM cache_meta WHERE key='algorithm'").fetchone()
+            from .imaging import ALGORITHM_VERSION
+            stored = str(row[0]) if row else ""
+            if stored != str(ALGORITHM_VERSION):
+                # Perceptual hashes from a different decode path are not
+                # comparable with fresh ones; clear rather than mix them.
+                self._db.execute("UPDATE entries SET phash=NULL, dhash=NULL, sharpness=NULL")
+                self._db.execute(
+                    "INSERT INTO cache_meta(key,value) VALUES('algorithm',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(ALGORITHM_VERSION),))
+            self._db.commit()
+        except sqlite3.Error as error:
+            log.warning("hash cache migration skipped: %s", error)
+
+    # -- batching ------------------------------------------------------
+    @contextmanager
+    def batch(self):
+        """Defer commits until the block ends.
+
+        Twenty thousand perceptual hashes meant twenty thousand commits, each
+        one a flush to disk. The rows are the same either way; only the number
+        of flushes changes, and a lost batch costs recomputation, never
+        correctness.
+        """
+        with self._lock:
+            self._batching += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._batching -= 1
+                if self._batching <= 0:
+                    self._batching = 0
+                    self._commit()
+
+    def _commit(self) -> None:
+        if self._db is None or not self._dirty:
+            return
+        try:
+            self._db.commit()
+            self._dirty = False
+        except sqlite3.Error as error:
+            log.debug("hash cache commit failed: %s", error)
+
+    def preload(self, paths) -> int:
+        """Read every cached row for *paths* in one query instead of one each."""
+        if self._db is None:
+            return 0
+        wanted = [str(p) for p in paths]
+        if not wanted:
+            return 0
+        found = 0
+        with self._lock:
+            for start in range(0, len(wanted), 400):
+                batch = wanted[start:start + 400]
+                marks = ",".join("?" * len(batch))
+                try:
+                    rows = self._db.execute(
+                        "SELECT path, size, mtime_ns, sha256, phash, dhash, sharpness, "
+                        f"captured FROM entries WHERE path IN ({marks})", batch).fetchall()
+                except sqlite3.Error:
+                    return found
+                for path, size, mtime_ns, sha, ph, dh, sharp, captured in rows:
+                    self._memory[(path, size, mtime_ns)] = {
+                        "sha256": sha, "phash": _from_text(ph), "dhash": _from_text(dh),
+                        "sharpness": sharp, "captured": captured}
+                    found += 1
+        return found
+
+    # -- keys ----------------------------------------------------------
+    @staticmethod
+    def key(path: str | Path) -> tuple | None:
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return (str(path), stat.st_size, stat.st_mtime_ns)
+
+    # -- access --------------------------------------------------------
+    def get(self, path: str | Path, field: str) -> object | None:
+        key = self.key(path)
+        if key is None:
+            return None
+        with self._lock:
+            row = self._memory.get(key)
+            if row is None and self._db is not None:
+                row = self._load(key)
+            if not row:
+                return None
+            value = row.get(field)
+            return value if value not in ("", None) else None
+
+    def put(self, path: str | Path, **values) -> None:
+        key = self.key(path)
+        if key is None:
+            return
+        clean = {k: v for k, v in values.items() if k in FIELDS and v is not None}
+        if not clean:
+            return
+        with self._lock:
+            row = dict(self._memory.get(key) or {})
+            row.update(clean)
+            self._memory[key] = row
+            if self._db is None:
+                return
+            try:
+                self._db.execute(
+                    "INSERT INTO entries(path,size,mtime_ns,sha256,phash,dhash,sharpness,"
+                    "captured,updated) VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,"
+                    " sha256=COALESCE(excluded.sha256, entries.sha256),"
+                    " phash=COALESCE(excluded.phash, entries.phash),"
+                    " dhash=COALESCE(excluded.dhash, entries.dhash),"
+                    " sharpness=COALESCE(excluded.sharpness, entries.sharpness),"
+                    " captured=COALESCE(excluded.captured, entries.captured),"
+                    " updated=excluded.updated",
+                    (key[0], key[1], key[2], row.get("sha256"),
+                     _to_text(row.get("phash")), _to_text(row.get("dhash")),
+                     row.get("sharpness"), row.get("captured"), time.time()),
+                )
+                self._dirty = True
+                if not self._batching:
+                    self._commit()
+            except sqlite3.Error as error:
+                log.debug("hash cache write failed: %s", error)
+
+    def _load(self, key: tuple) -> dict | None:
+        if self._db is None:
+            return None
+        try:
+            cursor = self._db.execute(
+                "SELECT size, mtime_ns, sha256, phash, dhash, sharpness, captured "
+                "FROM entries WHERE path=?", (key[0],),
+            )
+            row = cursor.fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        size, mtime_ns, sha, ph, dh, sharp, captured = row
+        if size != key[1] or mtime_ns != key[2]:
+            return None                     # the file changed; recompute
+        value = {"sha256": sha, "phash": _from_text(ph), "dhash": _from_text(dh),
+                 "sharpness": sharp, "captured": captured}
+        self._memory[key] = value
+        return value
+
+    def compute(self, path: str | Path, field: str, producer) -> object | None:
+        """Return the cached value, computing and storing it on a miss."""
+        cached = self.get(path, field)
+        if cached is not None:
+            return cached
+        value = producer(path)
+        if value is not None:
+            self.put(path, **{field: value})
+        return value
+
+    def prune(self, older_than_days: int = 90) -> int:
+        if self._db is None:
+            return 0
+        cutoff = time.time() - older_than_days * 86400
+        try:
+            cursor = self._db.execute("DELETE FROM entries WHERE updated < ?", (cutoff,))
+            self._db.commit()
+            return cursor.rowcount or 0
+        except sqlite3.Error:
+            return 0
+
+    def count(self) -> int:
+        if self._db is None:
+            return len(self._memory)
+        try:
+            return int(self._db.execute("SELECT COUNT(*) FROM entries").fetchone()[0])
+        except sqlite3.Error:
+            return 0
+
+    def close(self) -> None:
+        with self._lock:
+            if self._db is not None:
+                self._batching = 0
+                self._commit()
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
+                self._db = None
+
+
+def _to_text(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return format(value, "016x")
+    return str(value)
+
+
+def _from_text(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value, 16)
+    except (TypeError, ValueError):
+        return None

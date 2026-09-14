@@ -1,0 +1,29 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.ruff_cache/
+.pytest_cache/
+
+# Build output
+build/
+dist/
+*.spec.bak
+
+# Local application data and diagnostics
+qingjian-portable/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and OS files
+.idea/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini

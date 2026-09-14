@@ -1,0 +1,8 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# Keep the documented default command focused on correctness failures.  The
+# project deliberately retains the author's compact Qt formatting style.
+select = ["E9", "F63", "F7", "F82"]

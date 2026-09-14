@@ -1,0 +1,530 @@
+"""The preview pane: stills, animations and video in one stack."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from collections import OrderedDict
+
+from PySide6.QtCore import (QObject, QRunnable, QSize, Qt, QThreadPool, QUrl,
+                            Signal)
+from PySide6.QtGui import QImage, QImageReader, QMovie, QPixmap, QTransform
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphicsScene,
+                               QGraphicsView, QHBoxLayout, QLabel, QPushButton, QSlider,
+                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+
+from ..core import imaging, mediatypes, video
+from ..core.i18n import tr
+from ..core.logsetup import get_logger
+from . import icons, theme
+from .thumbs import pil_to_qimage
+
+log = get_logger("preview")
+
+#: Formats Qt itself can decode. Anything else (raw, and often HEIC or JXL)
+#: goes through Pillow, which can also lift a raw file's embedded preview.
+_QT_READABLE = {bytes(fmt).decode("ascii", "ignore").lower()
+                for fmt in QImageReader.supportedImageFormats()}
+
+
+def decode_qimage(path: str | Path, target: QSize) -> tuple[QImage, str]:
+    """Decode *path* at no more than *target*, as cheaply as the format allows.
+
+    Safe to call from a worker thread: it produces a ``QImage``, never a
+    ``QPixmap``. ``setScaledSize`` lets Qt's JPEG reader scale straight out of
+    the DCT coefficients, which is the reason a full-size photograph appears
+    the instant it is asked for rather than a third of a second later.
+    """
+    target_path = Path(path)
+    suffix = target_path.suffix.lstrip(".").lower()
+    error = ""
+    if suffix in _QT_READABLE and not mediatypes.is_raw(target_path):
+        reader = QImageReader(str(target_path))
+        reader.setAutoTransform(True)
+        original = reader.size()
+        if original.isValid() and (original.width() > target.width()
+                                   or original.height() > target.height()):
+            reader.setScaledSize(original.scaled(target, Qt.AspectRatioMode.KeepAspectRatio))
+        image = reader.read()
+        if not image.isNull():
+            return image, ""
+        error = reader.errorString()
+    try:
+        wanted = (max(target.width(), 640), max(target.height(), 640))
+        # A raw preview or a 24 MP HEIC does not need decoding in full to fill
+        # a 1400 px pane, so the request is passed down to the decoder.
+        pil = imaging.open_image(target_path, wanted)
+        pil.thumbnail(wanted)
+        return pil_to_qimage(pil), ""
+    except Exception as pillow_error:
+        return QImage(), error or str(pillow_error)
+
+
+def decode_pixmap(path: str | Path, target: QSize) -> tuple[QPixmap, str]:
+    """Decode *path* no larger than needed. Interface thread only."""
+    image, error = decode_qimage(path, target)
+    return (QPixmap(), error) if image.isNull() else (QPixmap.fromImage(image), "")
+
+
+class _PreloadSignals(QObject):
+    ready = Signal(object, object)
+
+
+class _PreloadTask(QRunnable):
+    def __init__(self, key: tuple, path: Path, target: QSize,
+                 signals: _PreloadSignals) -> None:
+        super().__init__()
+        self.key = key
+        self.path = path
+        self.target = target
+        self.signals = signals
+
+    def run(self) -> None:                       # noqa: D401 - Qt entry point
+        # The key travels with the task: the pane can be resized while a decode
+        # is in flight, and two sizes of one file must not be filed under each
+        # other's key.
+        image, _error = decode_qimage(self.path, self.target)
+        self.signals.ready.emit(self.key, None if image.isNull() else image)
+
+
+class PreviewPrefetcher(QObject):
+    """Decodes the neighbouring items so that the next key press is instant.
+
+    The previous version did this and it is most of what made the program feel
+    light; the rewrite lost it. Only a couple of frames are ever held, so the
+    memory cost is small and bounded.
+    """
+
+    #: Emitted with a path string once its image is in the cache.
+    arrived = Signal(str)
+
+    def __init__(self, depth: int = 4, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._cache: "OrderedDict[tuple, QImage]" = OrderedDict()
+        self._pending: set[tuple] = set()
+        self._depth = max(2, depth)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(2)
+        self._signals = _PreloadSignals()
+        self._signals.ready.connect(self._store)
+
+    @staticmethod
+    def _key(path: Path, target: QSize) -> tuple:
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return (str(path), target.width(), 0, 0)
+        return (str(path), target.width(), stat.st_size, stat.st_mtime_ns)
+
+    def take(self, path: str | Path, target: QSize) -> QPixmap | None:
+        """A decoded neighbour, if one was ready. Interface thread only."""
+        image = self._cache.get(self._key(Path(path), target))
+        if image is None or image.isNull():
+            return None
+        return QPixmap.fromImage(image)
+
+    def prefetch(self, paths, target: QSize) -> None:
+        for path in list(paths)[:self._depth]:
+            self.request(path, target, priority=0)
+
+    def request(self, path: str | Path, target: QSize, priority: int = 1) -> bool:
+        """Decode *path* on a worker. True when it was queued or already in hand.
+
+        A priority above zero jumps the neighbours already queued, which is what
+        the file actually on screen needs.
+        """
+        candidate = Path(path)
+        if mediatypes.is_video(candidate):
+            return False
+        key = self._key(candidate, target)
+        if key in self._cache:
+            return True
+        if key in self._pending:
+            return True
+        self._pending.add(key)
+        self._pool.start(_PreloadTask(key, candidate, target, self._signals), priority)
+        return True
+
+    def _store(self, key, image) -> None:
+        self._pending.discard(key)
+        if image is not None:
+            self._cache[key] = image
+        while len(self._cache) > self._depth:
+            self._cache.popitem(last=False)
+        self.arrived.emit(key[0])
+
+    def clear(self) -> None:
+        """Forget everything, including work still in flight for the old folder."""
+        # Dropping the bookkeeping alone left the previous folder's decodes
+        # queued: they still ran, still landed in the cache and still evicted
+        # the file now on screen.
+        self._pool.clear()
+        self._cache.clear()
+        self._pending.clear()
+
+    def shutdown(self) -> None:
+        self._pool.clear()
+        self._pool.waitForDone(2000)
+
+
+class ImageSurface(QGraphicsView):
+    """Zoom with the wheel, pan by dragging, double-click to fit."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._item = QGraphicsPixmapItem()
+        self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._scene.addItem(self._item)
+        self._original = QPixmap()
+        self._rotation = 0
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet(f"background: {theme.SUNKEN}; border: none;")
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        self._original = pixmap
+        self._rotation = 0
+        self._apply()
+
+    def clear_media(self) -> None:
+        self._original = QPixmap()
+        self._item.setPixmap(QPixmap())
+        self._scene.setSceneRect(0, 0, 1, 1)
+
+    def _apply(self) -> None:
+        pixmap = self._original
+        if self._rotation:
+            pixmap = pixmap.transformed(QTransform().rotate(self._rotation),
+                                        Qt.TransformationMode.SmoothTransformation)
+        self._item.setPixmap(pixmap)
+        self._scene.setSceneRect(self._item.boundingRect())
+        self.fit()
+
+    def fit(self) -> None:
+        if self._item.pixmap().isNull():
+            return
+        self.resetTransform()
+        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def zoom_percent(self) -> int:
+        if self._item.pixmap().isNull():
+            return 100
+        return max(1, int(round(self.transform().m11() * 100)))
+
+    def rotate_by(self, degrees: int) -> None:
+        """Rotate the preview only. The file on disk is never modified."""
+        if self._original.isNull():
+            return
+        self._rotation = (self._rotation + degrees) % 360
+        self._apply()
+
+    def wheelEvent(self, event) -> None:            # noqa: N802 - Qt naming
+        if self._item.pixmap().isNull():
+            return
+        step = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(step, step)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self.fit()
+
+    def resizeEvent(self, event) -> None:            # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self.fit()
+
+
+class EmptySurface(QWidget):
+    choose_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(10)
+        glyph = QLabel()
+        glyph.setPixmap(icons.pixmap("folder", 56, "#6651D4", 1.6))
+        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title = QLabel(tr("header.no_folder"))
+        self.title.setObjectName("emptyTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hint = QLabel(tr("scan.hint_adjust"))
+        self.hint.setObjectName("emptyText")
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.glyph = glyph
+        self.button = QPushButton(tr("header.choose_folder"))
+        self.button.setObjectName("primaryButton")
+        self.button.clicked.connect(self.choose_requested)
+        layout.addWidget(glyph)
+        layout.addWidget(self.title)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def set_busy(self, busy: bool) -> None:
+        """Hide the folder button while this stands in for a file that is opening."""
+        self.button.setVisible(not busy)
+        self.glyph.setPixmap(
+            icons.pixmap("camera" if busy else "folder", 56, "#6651D4", 1.6))
+
+    def retranslate(self, title: str = "", hint: str = "") -> None:
+        self.title.setText(title or tr("header.no_folder"))
+        self.hint.setText(hint or tr("scan.hint_adjust"))
+
+
+class MediaPreview(QWidget):
+    """Shows whatever the current item is, and reports what it could not show."""
+
+    choose_requested = Signal()
+    video_error = Signal(str)
+    frame_stepped = Signal(float)
+
+    EMPTY, IMAGE, ANIMATED, VIDEO = 0, 1, 2, 3
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.current_path: Path | None = None
+        self._movie: QMovie | None = None
+        self._frame_time: float | None = None
+        self._frame_path: Path | None = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("previewStack")
+        self.empty = EmptySurface()
+        self.empty.choose_requested.connect(self.choose_requested)
+        self.image = ImageSurface()
+        self.animated = QLabel()
+        self.animated.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.animated.setStyleSheet(f"background: {theme.SUNKEN};")
+
+        self.video_page = QWidget()
+        video_layout = QVBoxLayout(self.video_page)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        video_layout.setSpacing(0)
+        self.video = QVideoWidget()
+        self.video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        video_layout.addWidget(self.video, 1)
+        video_layout.addWidget(self._build_controls())
+
+        for widget in (self.empty, self.image, self.animated, self.video_page):
+            self.stack.addWidget(widget)
+        outer.addWidget(self.stack)
+
+        self.audio = QAudioOutput(self)
+        self.audio.setVolume(0.6)
+        self.player = QMediaPlayer(self)
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video)
+        self.player.positionChanged.connect(self._position_changed)
+        self.player.durationChanged.connect(self._duration_changed)
+        self.player.playbackStateChanged.connect(self._state_changed)
+        self.player.errorOccurred.connect(self._error)
+        self.volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
+
+    # -- controls ------------------------------------------------------
+    def _build_controls(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("videoControls")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(8)
+
+        def round_button(name: str, tip: str) -> QToolButton:
+            button = QToolButton()
+            button.setObjectName("roundButton")
+            button.setIcon(icons.icon(name, 14, theme.TEXT))
+            button.setIconSize(QSize(14, 14))
+            button.setToolTip(tip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            return button
+
+        self.back_button = round_button("chevron-left", "J  −5s")
+        self.back_button.clicked.connect(lambda: self.seek_relative(-5000))
+        self.play_button = round_button("play", "K / Space")
+        self.play_button.clicked.connect(self.toggle_play)
+        self.forward_button = round_button("chevron-right", "L  +5s")
+        self.forward_button.clicked.connect(lambda: self.seek_relative(5000))
+        self.position = QSlider(Qt.Orientation.Horizontal)
+        self.position.setRange(0, 0)
+        self.position.sliderMoved.connect(self.player_seek)
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setObjectName("timeLabel")
+        self.speed = QComboBox()
+        for text, value in (("0.5×", 0.5), ("1×", 1.0), ("1.5×", 1.5), ("2×", 2.0)):
+            self.speed.addItem(text, value)
+        self.speed.setCurrentIndex(1)
+        self.speed.currentIndexChanged.connect(
+            lambda: self.player.setPlaybackRate(float(self.speed.currentData())))
+        self.mute_button = round_button("volume", "M")
+        self.mute_button.clicked.connect(self.toggle_mute)
+        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(60)
+        self.volume.setFixedWidth(72)
+
+        for widget in (self.back_button, self.play_button, self.forward_button):
+            row.addWidget(widget)
+        row.addWidget(self.position, 1)
+        row.addWidget(self.time_label)
+        row.addWidget(self.speed)
+        row.addWidget(self.mute_button)
+        row.addWidget(self.volume)
+        return bar
+
+    # -- showing -------------------------------------------------------
+    def _show_empty(self, title: str = "", hint: str = "") -> None:
+        self.current_path = None
+        self.release()
+        self.image.clear_media()
+        self.empty.retranslate(title, hint)
+        self.stack.setCurrentIndex(self.EMPTY)
+
+    def show_loading(self, path: str | Path, title: str = "", hint: str = "") -> None:
+        """Stand in for a file whose decode is happening on a worker.
+
+        The empty surface carries a "choose folder" button, which has no
+        business being offered while a file is opening, so it is hidden for the
+        duration.
+        """
+        self.current_path = Path(path)
+        self._frame_time = None
+        self._frame_path = None
+        self.release()
+        self.image.clear_media()
+        self.empty.set_busy(True)
+        self.empty.retranslate(title or Path(path).name, hint)
+        self.stack.setCurrentIndex(self.EMPTY)
+
+    def show_empty(self, title: str = "", hint: str = "") -> None:
+        self.empty.set_busy(False)
+        self._show_empty(title, hint)
+
+    def show_path(self, path: str | Path, cached: QPixmap | None = None) -> tuple[bool, str]:
+        target = Path(path)
+        self.current_path = target
+        self._frame_time = None
+        self._frame_path = None
+        self.release()
+
+        if mediatypes.is_video(target):
+            self.image.clear_media()
+            self.stack.setCurrentIndex(self.VIDEO)
+            self.player.setSource(QUrl.fromLocalFile(str(target)))
+            self.player.play()
+            return True, ""
+
+        if mediatypes.may_animate(target):
+            movie = QMovie(str(target))
+            if movie.isValid() and movie.frameCount() > 1:
+                self._movie = movie
+                self.animated.setMovie(movie)
+                movie.start()
+                self.stack.setCurrentIndex(self.ANIMATED)
+                return True, ""
+
+        pixmap = cached
+        error = ""
+        if pixmap is None or pixmap.isNull():
+            pixmap, error = decode_pixmap(
+                target, QSize(max(1400, self.image.width() * 2),
+                              max(1000, self.image.height() * 2)))
+        if pixmap.isNull():
+            self.image.clear_media()
+            self.stack.setCurrentIndex(self.IMAGE)
+            return False, error or tr("error.decode_image")
+        self.image.set_pixmap(pixmap)
+        self.stack.setCurrentIndex(self.IMAGE)
+        return True, ""
+
+    def release(self) -> None:
+        """Let go of the file so a move or delete cannot be blocked by us."""
+        self.player.stop()
+        self.player.setSource(QUrl())
+        if self._movie is not None:
+            self._movie.stop()
+            self.animated.setMovie(None)
+            self._movie = None
+
+    # -- playback ------------------------------------------------------
+    def is_video_page(self) -> bool:
+        return self.stack.currentIndex() == self.VIDEO
+
+    def toggle_play(self) -> None:
+        if self._frame_path == self.current_path and self._frame_time is not None:
+            self.stack.setCurrentIndex(self.VIDEO)
+            self.player.setPosition(int(round(self._frame_time * 1000)))
+            self._frame_time = None
+            self.player.play()
+            return
+        if not self.is_video_page():
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def seek_relative(self, milliseconds: int) -> None:
+        if self.is_video_page():
+            self.player.setPosition(max(0, min(self.player.duration(),
+                                               self.player.position() + milliseconds)))
+
+    def player_seek(self, value: int) -> None:
+        self.player.setPosition(value)
+
+    def toggle_mute(self) -> None:
+        muted = not self.audio.isMuted()
+        self.audio.setMuted(muted)
+        self.mute_button.setIcon(icons.icon("mute" if muted else "volume", 14, theme.TEXT))
+
+    def step_frame(self, direction: int) -> str:
+        """Show the neighbouring frame by its real timestamp. Returns a status line."""
+        path = self.current_path
+        if path is None or not mediatypes.is_video(path):
+            return ""
+        if not video.available():
+            self.seek_relative(40 * direction)
+            return ""
+        self.player.pause()
+        base = (self._frame_time if self._frame_path == path and self._frame_time is not None
+                else self.player.position() / 1000)
+        result = video.frame_at(path, base, direction)
+        if result is None:
+            return tr("error.no_frame")
+        image, timestamp = result
+        self._frame_time, self._frame_path = timestamp, path
+        self.image.set_pixmap(QPixmap.fromImage(pil_to_qimage(image)))
+        self.stack.setCurrentIndex(self.IMAGE)
+        self.frame_stepped.emit(timestamp)
+        return f"{timestamp:.6f}"
+
+    # -- player signals ------------------------------------------------
+    def _position_changed(self, position: int) -> None:
+        if not self.position.isSliderDown():
+            self.position.setValue(position)
+        self.time_label.setText(f"{_clock(position)} / {_clock(self.player.duration())}")
+
+    def _duration_changed(self, duration: int) -> None:
+        self.position.setRange(0, max(0, duration))
+
+    def _state_changed(self, state) -> None:
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_button.setIcon(icons.icon("pause" if playing else "play", 14, theme.TEXT))
+        if playing:
+            self._frame_time = None
+
+    def _error(self, _code, message: str) -> None:
+        if self.current_path is not None and message:
+            self.video_error.emit(message)
+
+
+def _clock(milliseconds: int) -> str:
+    seconds = max(0, int(milliseconds) // 1000)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
