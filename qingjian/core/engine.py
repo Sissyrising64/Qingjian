@@ -806,6 +806,9 @@ class Engine:
             if parent != root and not (self.settings.recursive
                                        and parent.is_relative_to(root)):
                 return False
+            # The recycle folder and anything else `scan` steps over.
+            if any(part.startswith(".qingjian") for part in parent.relative_to(root).parts):
+                return False
             for folder in excluded:
                 try:
                     resolved = Path(folder).resolve()
@@ -917,6 +920,21 @@ class Engine:
         root = self.source_root or Path(".")
         with self.exclusive():
             return self._commit(self.planner.plan_restore_ignored(root))
+
+    def hidden_handled(self) -> int:
+        """Files in this folder that copying or favouriting took out of the queue."""
+        if self.source_root is None or self.review_mode:
+            return 0
+        return self.state.done_under(str(self.source_root), self.settings.recursive)
+
+    def reveal_handled(self, progress=_noop, cancel=_never) -> int:
+        """Put those files back in the queue. They never moved; they were only marked."""
+        if self.source_root is None:
+            return 0
+        with self.exclusive():
+            cleared = self.state.clear_done_under(str(self.source_root), self.settings.recursive)
+        self.rebuild_queue(progress, cancel)
+        return cleared
 
     def send_to_review(self, paths: Sequence[Path]) -> None:
         if not self.source_root:

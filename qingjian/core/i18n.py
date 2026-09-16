@@ -25,6 +25,7 @@ CATALOG: dict[str, tuple[str, str]] = {
     "app.name": ("轻拣", "Qingjian"),
     "app.tagline": ("图片与视频快速分类", "Fast photo and video sorting"),
     "app.subtitle": ("MEDIA SORTER", "MEDIA SORTER"),
+    "app.open_with": ("用轻拣打开", "Open with Qingjian"),
 
     # ---- generic actions ----------------------------------------------
     "ok": ("确定", "OK"),
@@ -176,6 +177,17 @@ CATALOG: dict[str, tuple[str, str]] = {
     "status.exported": ("记录已导出", "Records exported"),
     "status.preview_failed": ("无法预览 {name}：{error}", "Cannot preview {name}: {error}"),
     "status.video_failed": ("视频预览失败：{error}", "Video preview failed: {error}"),
+    "status.reserved_key": (
+        "按键 {keys} 与内置快捷键冲突，内置功能照常可用；请在按键设置里换一个键",
+        "Key {keys} clashes with a built-in shortcut, which keeps working — pick another key",
+    ),
+    "status.hidden_handled": (
+        "{count} 个复制或收藏过的文件已隐藏 · 重新显示",
+        "{count} copied or favourited files hidden · show them again",
+    ),
+    "status.handled_revealed": ("已重新显示 {count} 个文件", "{count} files are back in the queue"),
+    "card.tip": ("单击：执行这个键的动作 · 右键：更换目标文件夹",
+                 "Click: run this key's action · Right-click: change its folder"),
 
     # ---- errors --------------------------------------------------------
     "error.title": ("操作未完成", "Operation not completed"),
@@ -510,15 +522,24 @@ CATALOG: dict[str, tuple[str, str]] = {
     ),
     "settings.quota": ("快照配额与自动回收", "Snapshot quota & auto-reclaim"),
     "settings.recycle": ("回收站行为", "Recycle behaviour"),
-    "settings.recycle.soft": ("仅应用内软删除", "App-side soft delete only"),
+    "settings.recycle.soft": ("同盘隐藏文件夹", "Hidden folder on the same drive"),
     "settings.recycle.soft.desc": (
-        "Ctrl+Z 可恢复，只占一份恢复副本",
-        "Ctrl+Z restores it; costs one restore copy",
+        "默认：移到文件旁边的隐藏文件夹，瞬间完成、不复制，Ctrl+Z 可恢复，按保留策略自动清理。"
+        "Windows 回收站：从回收站手动还原，Ctrl+Z 不能撤销",
+        "Default: moved into a hidden folder beside the file — instant, nothing copied, "
+        "Ctrl+Z restores it, cleared by the retention policy. "
+        "Windows recycle bin: restore it from the bin; Ctrl+Z cannot undo it",
     ),
-    "settings.recycle.system": ("同时送进系统回收站", "Also send to the system recycle bin"),
+    "settings.recycle.system": ("Windows 回收站", "Windows recycle bin"),
     "settings.recycle.system.desc": (
-        "大文件会同时占用两份空间，且从系统回收站还原的是带标记的副本",
-        "Large files cost twice the space, and what the system bin restores is a tagged copy",
+        "从系统回收站手动还原，Ctrl+Z 不能撤销",
+        "Restore it from the recycle bin; Ctrl+Z cannot undo it",
+    ),
+    "settings.folder_menu": ("资源管理器右键菜单", "Explorer folder menu"),
+    "settings.folder_menu.desc": (
+        "在文件夹上右键即可“用轻拣打开”；轻拣已经开着时会直接切到那个文件夹。只写当前用户的注册表，不需要管理员权限",
+        "Right-click a folder to open it here; if Qingjian is already open it switches to "
+        "that folder. Written for this user only, no administrator rights needed",
     ),
     "settings.logging": ("保留运行日志", "Keep a run log"),
     "settings.logging.desc": (
@@ -581,6 +602,10 @@ CATALOG: dict[str, tuple[str, str]] = {
     "bind.target_folder": ("目标文件夹", "Target folder"),
     "bind.choose_for": ("为 {key} 选择目标文件夹", "Choose a target folder for {key}"),
     "bind.duplicate_key": ("快捷键 {key} 重复，请改成不同的键。", "Key {key} is used twice — pick another."),
+    "bind.reserved_key": (
+        "快捷键 {key} 已被窗口占用（例如 G 网格、S 稍后、J K L 视频、M 静音），请换一个键。",
+        "Key {key} is already used by the window (G grid, S later, J K L video, M mute) — pick another.",
+    ),
     "bind.reset_keys": ("重置为 1–0", "Reset to 1–0"),
     "bind.edit_template": ("编辑模板", "Edit template"),
 

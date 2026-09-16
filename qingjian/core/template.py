@@ -153,7 +153,7 @@ def _resolve_one(body: str, ctx: TemplateContext, strict: bool) -> str:
                 pad = int(arg)
             except ValueError:
                 if strict:
-                    raise NameError_("tpl.unknown_token", token="{" + body + "}")
+                    raise NameError_("tpl.unknown_token", token="{" + body + "}") from None
         else:
             default = arg
     name = name.strip()

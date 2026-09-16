@@ -318,16 +318,29 @@ class MediaPreview(QWidget):
             self.stack.addWidget(widget)
         outer.addWidget(self.stack)
 
-        self.audio = QAudioOutput(self)
-        self.audio.setVolume(0.6)
+        #: Opened with the first video, not here: on some machines asking for the
+        #: audio device takes a second and a half, and most sessions are photos.
+        self.audio: QAudioOutput | None = None
+        self._muted = False
         self.player = QMediaPlayer(self)
-        self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
         self.player.positionChanged.connect(self._position_changed)
         self.player.durationChanged.connect(self._duration_changed)
         self.player.playbackStateChanged.connect(self._state_changed)
         self.player.errorOccurred.connect(self._error)
-        self.volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
+        self.volume.valueChanged.connect(self._volume_changed)
+
+    def _open_audio(self) -> None:
+        if self.audio is not None:
+            return
+        self.audio = QAudioOutput(self)
+        self.audio.setVolume(self.volume.value() / 100)
+        self.audio.setMuted(self._muted)
+        self.player.setAudioOutput(self.audio)
+
+    def _volume_changed(self, value: int) -> None:
+        if self.audio is not None:
+            self.audio.setVolume(value / 100)
 
     # -- controls ------------------------------------------------------
     def _build_controls(self) -> QFrame:
@@ -417,6 +430,7 @@ class MediaPreview(QWidget):
         if mediatypes.is_video(target):
             self.image.clear_media()
             self.stack.setCurrentIndex(self.VIDEO)
+            self._open_audio()
             self.player.setSource(QUrl.fromLocalFile(str(target)))
             self.player.play()
             return True, ""
@@ -443,6 +457,21 @@ class MediaPreview(QWidget):
         self.image.set_pixmap(pixmap)
         self.stack.setCurrentIndex(self.IMAGE)
         return True, ""
+
+    def show_still(self, path: str | Path, pixmap: QPixmap) -> None:
+        """Put an already-decoded picture up at once, standing in for *path*.
+
+        While an arrow key is held this is all the preview does per item: no
+        decode, no player, no animation check. A playing video stops, so its
+        sound does not carry on under the pictures flipping past.
+        """
+        self.current_path = Path(path)
+        self._frame_time = None
+        self._frame_path = None
+        if self.stack.currentIndex() in (self.VIDEO, self.ANIMATED):
+            self.release()
+        self.image.set_pixmap(pixmap)
+        self.stack.setCurrentIndex(self.IMAGE)
 
     def release(self) -> None:
         """Let go of the file so a move or delete cannot be blocked by us."""
@@ -480,9 +509,10 @@ class MediaPreview(QWidget):
         self.player.setPosition(value)
 
     def toggle_mute(self) -> None:
-        muted = not self.audio.isMuted()
-        self.audio.setMuted(muted)
-        self.mute_button.setIcon(icons.icon("mute" if muted else "volume", 14, theme.TEXT))
+        self._muted = not self._muted
+        if self.audio is not None:
+            self.audio.setMuted(self._muted)
+        self.mute_button.setIcon(icons.icon("mute" if self._muted else "volume", 14, theme.TEXT))
 
     def step_frame(self, direction: int) -> str:
         """Show the neighbouring frame by its real timestamp. Returns a status line."""

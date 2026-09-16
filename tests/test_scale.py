@@ -9,7 +9,7 @@ import ast
 from pathlib import Path
 
 from base import ROOT, TempCase, unittest
-from qingjian.core import config, sidecar
+from qingjian.core import config, scanner
 from qingjian.core.engine import Engine
 
 PACKAGE = ROOT / "qingjian"
@@ -60,6 +60,68 @@ class LazyLoadingTests(unittest.TestCase):
         source = PACKAGE / "ui" / "browsers.py"
         calls = self._calls(self._method(source, "_Browser", "request_visible"))
         self.assertIn("cache.set_wanted", calls)
+
+
+class ScanCostTests(TempCase):
+    """Asking each file about itself is a system call per file.
+
+    On Windows every one of those opens the file. Twenty thousand photographs
+    took five seconds to scan and another two and a half to filter, when the
+    directory listing already carries the same answer.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.library = self.tmp / "library"
+        for folder in ("", "Day1", "Day2"):
+            for index in range(40):
+                self.write(self.library / folder / f"IMG_{index:03d}.JPG", b"x")
+
+    def count_file_queries(self) -> dict:
+        counted = {"n": 0}
+        originals = {name: getattr(Path, name)
+                     for name in ("is_file", "is_symlink", "is_dir", "exists", "stat", "lstat")}
+
+        def counting(real):
+            def wrapper(this, *args, **kwargs):
+                counted["n"] += 1
+                return real(this, *args, **kwargs)
+            return wrapper
+
+        for name, real in originals.items():
+            setattr(Path, name, counting(real))
+        self.addCleanup(lambda: [setattr(Path, name, real) for name, real in originals.items()])
+        return counted
+
+    def test_scanning_reads_the_listing_not_each_file(self):
+        counted = self.count_file_queries()
+        found = scanner.scan(self.library, recursive=True)
+        self.assertEqual(120, len(found))
+        self.assertLessEqual(counted["n"], 10, f"{counted['n']} file queries for 120 files")
+
+    def test_filtering_lists_each_folder_instead_of_asking_each_file(self):
+        paths = scanner.scan(self.library, recursive=True)
+        gone = self.library / "Day1" / "IMG_007.JPG"
+        gone.unlink()
+        counted = self.count_file_queries()
+        kept = scanner.apply_filter(paths, scanner.FilterSpec())
+        self.assertEqual(119, len(kept))
+        self.assertNotIn(gone, kept)
+        self.assertLessEqual(counted["n"], 10, f"{counted['n']} file queries for 120 files")
+
+    def test_a_narrowing_filter_still_drops_a_file_removed_since_the_scan(self):
+        paths = scanner.scan(self.library, recursive=True)
+        gone = self.library / "Day2" / "IMG_003.JPG"
+        gone.unlink()
+        kept = scanner.apply_filter(paths, scanner.FilterSpec(mode="images"))
+        self.assertEqual(119, len(kept))
+        self.assertNotIn(gone, kept)
+
+    def test_the_hidden_recycle_folder_is_never_scanned(self):
+        self.write(self.library / "Day1" / ".qingjian-trash" / "0123abcd.JPG", b"x")
+        found = scanner.scan(self.library, recursive=True)
+        self.assertEqual(120, len(found))
+        self.assertFalse(any(".qingjian-trash" in p.parts for p in found))
 
 
 class FolderWorkTests(TempCase):

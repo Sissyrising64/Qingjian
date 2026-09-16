@@ -4,6 +4,11 @@
 Build with:
     python -m PyInstaller --noconfirm qingjian.spec
 
+The result is a folder, dist/MediaSorter, with MediaSorter.exe inside: ship the
+whole folder. A one-file build unpacked about 250 MB into a temporary folder on
+every launch, which cost two seconds before any of the program ran; UPX then
+made Windows decompress the Qt libraries again on top of that.
+
 The executable is named MediaSorter.exe on purpose. The interface is still
 called 轻拣; a non-ASCII executable name reproduced a native-window crash on
 the delivery machine, so the file name stays ASCII.
@@ -47,16 +52,13 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="MediaSorter",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=True,
     hide_console="hide-early",
     disable_windowed_traceback=False,
@@ -64,4 +66,13 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="MediaSorter",
 )

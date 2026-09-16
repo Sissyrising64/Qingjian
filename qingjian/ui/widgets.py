@@ -312,13 +312,25 @@ class BindingCard(QFrame):
         self.count = Pill("", accent=True)
         self.count.setVisible(False)
         row.addWidget(self.count, 0)
+        #: Set by a double click, whose closing release is not a second click.
+        self._release_ends_double_click = False
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        self.folder_requested.emit(self.index)
+        # Qt delivers press, release, press, double-click, release. Acting on
+        # both releases filed two photographs, and changing the folder here came
+        # after the first of them had already gone. The folder is a right-click.
+        self._release_ends_double_click = True
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.activated.emit(self.index)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._release_ends_double_click:
+            self._release_ends_double_click = False
+            return
+        self.activated.emit(self.index)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self.folder_requested.emit(self.index)
 
     def update_binding(self, binding, count: int = 0, action_label: str = "",
                        badge_text: str = "") -> None:
@@ -334,6 +346,7 @@ class BindingCard(QFrame):
         self.badge.setVisible(bool(badge_text))
         self.count.setText(str(count))
         self.count.setVisible(bool(count))
+        self.setToolTip(tr("card.tip"))
         self.setProperty("configured", "true" if binding.is_configured() else "false")
         self.style().unpolish(self)
         self.style().polish(self)

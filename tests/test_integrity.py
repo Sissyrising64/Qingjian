@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 
 from base import ROOT, TempCase, unittest
-from qingjian.core import config, safestore
+from qingjian.core import config, ops, safestore
 from qingjian.core.engine import Engine
 from qingjian.core.safestore import TransactionError
 
@@ -90,11 +90,15 @@ class HistoryBranchTests(TempCase):
         self.assertTrue(engine.can_redo())
 
     def test_dropping_the_branch_releases_its_restore_copies(self):
-        """A truncated record's snapshots are deleted, not orphaned on disk."""
+        """A truncated record's snapshots are deleted, not orphaned on disk.
+
+        Replacing a file is what keeps a restore copy after undo: redo needs it
+        to replace that file again.
+        """
         engine, source, binding = self.build()
-        trash = config.Binding(key="9", action="trash", folder="")
-        engine.settings.recycle_mode = config.RECYCLE_SOFT
-        engine.classify(trash, source / "img2.jpg")
+        self.write(self.tmp / "f1" / "img2.jpg", b"the file that gets replaced")
+        engine.classify(binding, source / "img2.jpg",
+                        resolver=lambda _source, _target: ops.CONFLICT_REPLACE)
         engine.undo()
         before = engine.store.usage(refresh=True)
         engine.classify(binding, source / "img0.jpg")

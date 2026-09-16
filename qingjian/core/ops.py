@@ -16,8 +16,8 @@ from . import metadata, naming, template
 from .config import Binding, Settings
 from .logsetup import get_logger
 from .naming import NameError_
-from .safestore import (Plan, SafeStore, TransactionError, identity, step_copy, step_move,
-                        step_unlink)
+from .safestore import (VERIFY_FAST, Plan, SafeStore, TransactionError, identity, step_copy,
+                        step_move, step_unlink)
 from .state import STACK_REDO, Record, StateStore, empty_delta
 
 log = get_logger("ops")
@@ -205,13 +205,15 @@ class Planner:
         forward: list[dict] = []
         snapshots: list[str] = []
         for source, destination in pairs:
-            source_id = identity(source, self.verify)
+            # Size and modification time say whether a file changed since this
+            # plan was made. Content is hashed only where bytes are copied.
+            source_id = identity(source, VERIFY_FAST)
             if source_id is None:
                 continue
             naming.check_path_length(destination)
             if destination.exists():
                 # Replacing: keep the old content so undo can put it back.
-                existing = identity(destination, self.verify)
+                existing = identity(destination, VERIFY_FAST)
                 snapshot = self.store.snapshot(destination)
                 if snapshot:
                     snapshots.append(snapshot["file"])
@@ -285,12 +287,12 @@ class Planner:
         forward: list[dict] = []
         snapshots: list[str] = []
         for source, destination in pairs:
-            source_id = identity(source, self.verify)
+            source_id = identity(source, VERIFY_FAST)
             if source_id is None:
                 continue
             naming.check_path_length(destination)
             if destination.exists():
-                existing = identity(destination, self.verify)
+                existing = identity(destination, VERIFY_FAST)
                 snapshot = self.store.snapshot(destination)
                 if snapshot:
                     snapshots.append(snapshot["file"])
@@ -317,9 +319,17 @@ class Planner:
         forward: list[dict] = []
         snapshots: list[str] = []
         for member in group.members:
-            current = identity(member.path, self.verify)
+            current = identity(member.path, VERIFY_FAST)
             if current is None:
                 continue
+            slot = self.store.trash_slot(member.path)
+            if slot is not None:
+                # A rename into the hidden folder beside the file: instant, on
+                # the same disk, undone by renaming it back.
+                forward.append(step_move(member.path, slot, current))
+                snapshots.append(str(slot))
+                continue
+            # No folder could be made there, so keep a restore copy instead.
             snapshot = self.store.snapshot(member.path)
             if snapshot:
                 snapshots.append(snapshot["file"])

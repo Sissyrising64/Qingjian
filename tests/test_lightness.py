@@ -12,7 +12,6 @@ from pathlib import Path
 from base import ROOT, TempCase, unittest
 from qingjian.core import config, mediatypes, metadata, scanner
 from qingjian.core.engine import Engine
-from qingjian.core.hashcache import HashCache
 from qingjian.core.sidecar import base_stem, group_key
 
 PACKAGE = ROOT / "qingjian"

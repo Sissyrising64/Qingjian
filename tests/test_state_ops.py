@@ -1,3 +1,4 @@
+import os
 import time
 
 from base import TempCase, unittest
@@ -73,6 +74,17 @@ class StateTests(TempCase):
         self.state.rename_tag("/a/1.jpg", "/b/1.jpg")
         self.assertEqual((5, "red"), self.state.tag("/b/1.jpg"))
         self.assertEqual((0, ""), self.state.tag("/a/1.jpg"))
+
+    def test_handled_files_are_counted_and_cleared_one_folder_at_a_time(self):
+        root = os.path.join(str(self.tmp), "lib")
+        inside = os.path.join(root, "a.jpg")
+        deeper = os.path.join(root, "sub", "b.jpg")
+        neighbour = os.path.join(str(self.tmp), "lib2", "c.jpg")   # shares the prefix "lib"
+        self.state.apply({"done_add": [inside, deeper, neighbour]})
+        self.assertEqual(1, self.state.done_under(root, recursive=False))
+        self.assertEqual(2, self.state.done_under(root, recursive=True))
+        self.assertEqual(1, self.state.clear_done_under(root, recursive=False))
+        self.assertEqual({deeper, neighbour}, self.state.done_paths())
 
     def test_clearing_a_tag_removes_the_row(self):
         self.state.apply({"tags_set": [["/a/1.jpg", 5, "red"]]})

@@ -42,6 +42,20 @@ class TempCase(unittest.TestCase):
             os.environ["QINGJIAN_DATA_DIR"] = self._previous
         self._tmp.cleanup()
 
+    def count_hashes(self) -> list[str]:
+        """Record the name of every file hashed in full, until the test ends."""
+        from qingjian.core import safestore
+        seen: list[str] = []
+        real = safestore.fingerprint
+
+        def counting(path, *args, **kwargs):
+            seen.append(Path(path).name)
+            return real(path, *args, **kwargs)
+
+        safestore.fingerprint = counting
+        self.addCleanup(setattr, safestore, "fingerprint", real)
+        return seen
+
     def write(self, path: Path, content: bytes = b"data") -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .logsetup import get_logger
-from .platform_ import free_space, same_volume
+from .platform_ import free_space, hide, same_volume
 
 log = get_logger("safestore")
 
@@ -41,6 +41,12 @@ Progress = Callable[[str, int], None]
 Cancel = Callable[[], bool]
 
 BLOCK = 1024 * 1024
+
+#: Where a recycled file waits: a hidden folder beside the one it came from.
+#: Getting there is a rename on the same disk -- instant, undone by renaming
+#: back -- where a restore copy in the application's own folder meant copying
+#: every recycled video onto the system drive.
+TRASH_DIR = ".qingjian-trash"
 
 # ``os.replace`` is atomic for readers, but Windows can briefly reject two
 # concurrent replacements of the same destination with ``PermissionError``.
@@ -351,6 +357,14 @@ class SafeStore:
         # interface thread, and the two then fought over that file: whoever
         # renamed it first left the other writing into nothing.
         self._lock = threading.RLock()
+        # Recycle folders live beside the user's files, so the usage total can
+        # only find them again after a restart if it keeps a list of them.
+        self.trash_index = self.root / "trash-folders.json"
+        self._trash_lock = threading.Lock()
+        try:
+            self._trash_folders: set[str] = set(read_json(self.trash_index, []) or [])
+        except ValueError:
+            self._trash_folders = set()
         self._sweep_writing()
 
     def _sweep_writing(self) -> None:
@@ -388,19 +402,50 @@ class SafeStore:
             self._usage += int(info["size"])
         return {"file": str(target), "hash": info.get("hash"), "size": info["size"]}
 
+    def trash_slot(self, path: str | Path) -> Path | None:
+        """A free name for *path* in the hidden recycle folder beside it.
+
+        None when that folder cannot be made there -- a file in the way, no
+        rights -- or the name would be too long; the caller then keeps a restore
+        copy instead.
+        """
+        path = Path(path)
+        slot = path.parent / TRASH_DIR / (uuid.uuid4().hex + path.suffix)
+        if len(str(slot)) > 259:
+            return None
+        try:
+            self._prepare_trash_folder(slot.parent)
+        except OSError:
+            return None
+        return slot
+
+    def _prepare_trash_folder(self, folder: Path) -> None:
+        if not folder.is_dir():
+            folder.mkdir(parents=True)
+            hide(folder)
+        with self._trash_lock:
+            if str(folder) in self._trash_folders:
+                return
+            self._trash_folders.add(str(folder))
+            atomic_json(self.trash_index, sorted(self._trash_folders))
+
     def usage(self, refresh: bool = False) -> int:
         if self._usage is not None and not refresh:
             return self._usage
+        with self._trash_lock:
+            folders = [self.snapshot_root, *map(Path, self._trash_folders)]
         total = 0
-        try:
-            for item in self.snapshot_root.iterdir():
-                if item.is_file():
-                    try:
-                        total += item.stat().st_size
-                    except OSError:
-                        continue
-        except OSError:
-            total = 0
+        for folder in folders:
+            try:
+                with os.scandir(folder) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
         self._usage = total
         return total
 
@@ -415,9 +460,30 @@ class SafeStore:
                 path.unlink()
             except OSError:
                 continue
+            if path.parent.name == TRASH_DIR:
+                self._drop_trash_folder_if_empty(path.parent)
         if self._usage is not None:
             self._usage = max(0, self._usage - freed)
         return freed
+
+    def _drop_trash_folder_if_empty(self, folder: Path) -> None:
+        try:
+            folder.rmdir()                  # refuses while anything is left in it
+        except OSError:
+            return
+        with self._trash_lock:
+            self._trash_folders.discard(str(folder))
+            atomic_json(self.trash_index, sorted(self._trash_folders))
+
+    def _count_recycled(self, src: Path, dst: Path, identity_: dict | None) -> None:
+        """Keep the usage total right as files go into and out of a recycle folder."""
+        if self._usage is None:
+            return
+        size = int((identity_ or {}).get("size") or 0)
+        if dst.parent.name == TRASH_DIR:
+            self._usage += size
+        elif src.parent.name == TRASH_DIR:
+            self._usage = max(0, self._usage - size)
 
     # -- executing -----------------------------------------------------
     def run(self, plan: Plan, progress: Progress = _NOOP_PROGRESS,
@@ -536,26 +602,35 @@ class SafeStore:
         result = step.get("result")
 
         if kind == MOVE:
+            # Identity here is size and modification time, never content: a
+            # rename has no copy to prove, and a cross-volume move proves its
+            # copy inside `_staged_copy`. Hashing both ends first read a 300 MB
+            # video twice for a rename that takes a millisecond.
             src = Path(step["src"])
-            done_at_dst = identity_matches(dst, result, verify)
+            done_at_dst = identity_matches(dst, result, VERIFY_FAST)
             if done_at_dst and not src.exists():
                 return False                            # already done
             if done_at_dst and src.exists():
                 # Crashed between writing the target and removing the source.
-                if identity_matches(src, step.get("src_id"), verify):
+                if identity_matches(src, step.get("src_id"), VERIFY_FAST):
                     src.unlink()
                     return True
                 raise TransactionError("error.changed_midway", str(src), path=str(src))
-            if not identity_matches(src, step.get("src_id"), verify):
+            if not identity_matches(src, step.get("src_id"), VERIFY_FAST):
                 raise TransactionError("error.external_change", str(src), path=str(src))
             if dst.exists():
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.parent.name == TRASH_DIR:
+                # Redo can land in a recycle folder that reclaiming has removed.
+                self._prepare_trash_folder(dst.parent)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
             if self.fast_path and same_volume(src, dst.parent):
                 os.replace(src, dst)
-                return True
-            self._staged_copy(src, dst, stage, verify, progress)
-            src.unlink()
+            else:
+                self._staged_copy(src, dst, stage, verify, progress)
+                src.unlink()
+            self._count_recycled(src, dst, step.get("src_id"))
             return True
 
         if kind == COPY:
@@ -564,11 +639,11 @@ class SafeStore:
             # also describes a finished copy. Checking both is what lets
             # recovery recognise a copy that completed just before the crash,
             # back when `result` had not been written to the journal yet.
-            if identity_matches(dst, result or step.get("src_id"), verify):
+            if identity_matches(dst, result or step.get("src_id"), VERIFY_FAST):
                 return False
             if dst.exists():
                 raise TransactionError("error.changed_midway", str(dst), path=str(dst))
-            if not identity_matches(src, step.get("src_id"), verify):
+            if not identity_matches(src, step.get("src_id"), VERIFY_FAST):
                 raise TransactionError("error.external_change", str(src), path=str(src))
             dst.parent.mkdir(parents=True, exist_ok=True)
             step["result"] = self._staged_copy(src, dst, stage, verify, progress)

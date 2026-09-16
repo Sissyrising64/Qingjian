@@ -61,6 +61,65 @@ def move_to_trash(path: str | Path) -> None:
     fn(str(path))
 
 
+#: Explorer's per-user verbs: a right-clicked folder (%1), and the empty
+#: background of an open one (%V). Under HKCU, so no administrator rights.
+FOLDER_MENU_KEYS = (
+    (r"Software\Classes\Directory\shell\Qingjian", "%1"),
+    (r"Software\Classes\Directory\Background\shell\Qingjian", "%V"),
+)
+
+
+def _registry(registry):
+    if registry is not None:
+        return registry
+    import winreg                        # Windows only; callers check IS_WINDOWS
+    return winreg
+
+
+def set_folder_menu(enabled: bool, label: str = "", command=(), registry=None) -> None:
+    """Add or remove "Open with Qingjian" on folders in Explorer, for this user."""
+    reg = _registry(registry)
+    for key, placeholder in FOLDER_MENU_KEYS:
+        if not enabled:
+            for path in (key + "\\command", key):       # a key with subkeys cannot go first
+                try:
+                    reg.DeleteKey(reg.HKEY_CURRENT_USER, path)
+                except FileNotFoundError:
+                    continue
+            continue
+        values = ((key, {"": label, "Icon": command[0]}),
+                  (key + "\\command",
+                   {"": " ".join(f'"{part}"' for part in [*command, placeholder])}))
+        for path, entries in values:
+            handle = reg.CreateKey(reg.HKEY_CURRENT_USER, path)
+            try:
+                for name, value in entries.items():
+                    reg.SetValueEx(handle, name, 0, reg.REG_SZ, value)
+            finally:
+                reg.CloseKey(handle)
+
+
+def folder_menu_installed(registry=None) -> bool:
+    try:
+        reg = _registry(registry)
+        reg.CloseKey(reg.OpenKey(reg.HKEY_CURRENT_USER, FOLDER_MENU_KEYS[0][0] + "\\command"))
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+def launch_command(frozen: bool, executable: str, script: str) -> list[str]:
+    """What Explorer should run to open a folder in this program.
+
+    A source checkout runs under pythonw.exe when there is one, so a folder
+    opened from the menu does not bring a console window with it.
+    """
+    if frozen:
+        return [executable]
+    windowed = Path(executable).with_name("pythonw.exe")
+    return [str(windowed if windowed.is_file() else Path(executable)), script]
+
+
 def reveal(path: str | Path) -> bool:
     """Show *path* in the system file manager. Returns False if it could not."""
     target = Path(path)
@@ -80,6 +139,20 @@ def reveal(path: str | Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def hide(path: str | Path) -> None:
+    """Set the hidden attribute on Windows. Elsewhere a leading dot already hides it."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        attributes = kernel32.GetFileAttributesW(str(path))
+        if attributes != 0xFFFFFFFF:                    # INVALID_FILE_ATTRIBUTES
+            kernel32.SetFileAttributesW(str(path), attributes | 0x2)
+    except (OSError, AttributeError):
+        pass
 
 
 def nearest_existing(path: str | Path) -> Path:

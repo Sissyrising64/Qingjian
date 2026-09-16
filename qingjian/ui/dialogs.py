@@ -130,7 +130,7 @@ class SidecarDialog(QDialog):
     """Confirm that the raw and the metadata travel with the photograph."""
 
     def __init__(self, group: SidecarGroup, target_name: str, target_folder: str,
-                 parent=None) -> None:
+                 parent=None, remember: bool = True) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr("sidecar.title"))
         self.setMinimumWidth(680)
@@ -193,7 +193,9 @@ class SidecarDialog(QDialog):
         layout.addWidget(note)
 
         self.remember = QCheckBox(tr("sidecar.remember"))
-        self.remember.setChecked(True)
+        # Ticked for "ask once"; unticked for "ask each time", where a ticked box
+        # turned asking off with the first answer.
+        self.remember.setChecked(remember)
         layout.addWidget(self.remember)
         layout.addStretch(1)
 

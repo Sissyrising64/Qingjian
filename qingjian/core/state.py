@@ -12,6 +12,7 @@ intent alongside the file changes and commit both together.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -357,6 +358,35 @@ class StateStore:
     def clear_done(self) -> None:
         with self._lock, self._db:
             self._db.execute("DELETE FROM done")
+
+    @staticmethod
+    def _inside(root: str, recursive: bool) -> tuple[str, list]:
+        """A WHERE clause selecting paths inside *root*, and its parameters.
+
+        A range on the primary key rather than LIKE, so it stays an index
+        lookup: every path under ``root\\`` sorts between that prefix and the
+        same prefix with its separator bumped by one code point.
+        """
+        prefix = os.path.join(str(root), "")
+        where = "path >= ? AND path < ?"
+        params: list = [prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)]
+        if not recursive:
+            where += " AND instr(substr(path, ?), ?) = 0"
+            params += [len(prefix) + 1, os.sep]
+        return where, params
+
+    def done_under(self, root: str, recursive: bool = True) -> int:
+        """How many handled files live inside *root*."""
+        where, params = self._inside(root, recursive)
+        with self._lock:
+            row = self._db.execute(f"SELECT COUNT(*) FROM done WHERE {where}", params).fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_done_under(self, root: str, recursive: bool = True) -> int:
+        """Forget that the files inside *root* were handled. Returns how many."""
+        where, params = self._inside(root, recursive)
+        with self._lock, self._db:
+            return self._db.execute(f"DELETE FROM done WHERE {where}", params).rowcount
 
     # -- duplicate ignore list -----------------------------------------
     def ignored_keys(self, root: str) -> set[str]:

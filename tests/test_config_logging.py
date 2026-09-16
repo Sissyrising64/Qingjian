@@ -53,6 +53,13 @@ class ConfigTests(TempCase):
         settings.bindings[1].key = settings.bindings[0].key
         self.assertEqual([settings.bindings[0].key], settings.duplicate_keys())
 
+    def test_a_key_the_window_already_uses_is_reported(self):
+        """Two shortcuts on one key cancel each other out, so neither fires."""
+        bindings = [config.Binding(key="1"), config.Binding(key="G"),
+                    config.Binding(key="space"), config.Binding(key="")]
+        self.assertEqual(["G", "space"],
+                         config.reserved_conflicts(bindings, ["g", "Space", "Ctrl+Z"]))
+
     def test_target_folders_span_every_preset(self):
         settings = config.Settings()
         settings.ensure_profile()
@@ -129,6 +136,75 @@ class PlatformTests(TempCase):
             self.skipTest("send2trash present")
         with self.assertRaises(platform_.TrashUnavailable):
             platform_.move_to_trash(self.write(self.tmp / "x.bin"))
+
+    SHELL = r"Software\Classes\Directory\shell\Qingjian"
+    BACKGROUND = r"Software\Classes\Directory\Background\shell\Qingjian"
+
+    def test_the_folder_menu_opens_the_folder_that_was_clicked(self):
+        registry = FakeRegistry()
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"C:\Apps\MediaSorter.exe"],
+                                  registry=registry)
+        self.assertEqual("Open with Qingjian", registry.keys[self.SHELL][""])
+        self.assertEqual('"C:\\Apps\\MediaSorter.exe" "%1"',
+                         registry.keys[self.SHELL + r"\command"][""])
+        self.assertEqual('"C:\\Apps\\MediaSorter.exe" "%V"',
+                         registry.keys[self.BACKGROUND + r"\command"][""])
+        self.assertTrue(platform_.folder_menu_installed(registry=registry))
+
+    def test_removing_the_folder_menu_leaves_nothing_behind(self):
+        registry = FakeRegistry()
+        platform_.set_folder_menu(True, "Open with Qingjian", [r"C:\Apps\MediaSorter.exe"],
+                                  registry=registry)
+        platform_.set_folder_menu(False, registry=registry)
+        self.assertEqual({}, registry.keys)
+        self.assertFalse(platform_.folder_menu_installed(registry=registry))
+        platform_.set_folder_menu(False, registry=registry)     # a second removal is harmless
+
+    def test_a_source_checkout_launches_without_a_console_window(self):
+        folder = self.tmp / "python"
+        self.write(folder / "python.exe", b"")
+        self.write(folder / "pythonw.exe", b"")
+        script = str(self.tmp / "main.py")
+        self.assertEqual([str(folder / "pythonw.exe"), script],
+                         platform_.launch_command(False, str(folder / "python.exe"), script))
+        self.assertEqual([r"C:\Apps\MediaSorter.exe"],
+                         platform_.launch_command(True, r"C:\Apps\MediaSorter.exe", script))
+
+
+class FakeRegistry:
+    """The part of winreg the folder menu touches.
+
+    Includes the rule that matters: a key that still has subkeys cannot be
+    deleted, so removal has to go leaf first.
+    """
+
+    HKEY_CURRENT_USER = "HKCU"
+    REG_SZ = 1
+
+    def __init__(self) -> None:
+        self.keys: dict[str, dict[str, str]] = {}
+
+    def CreateKey(self, root, path):            # noqa: N802 - winreg naming
+        self.keys.setdefault(path, {})
+        return path
+
+    def OpenKey(self, root, path):              # noqa: N802 - winreg naming
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return path
+
+    def SetValueEx(self, key, name, reserved, kind, value):  # noqa: N802 - winreg naming
+        self.keys[key][name] = value
+
+    def CloseKey(self, key):                    # noqa: N802 - winreg naming
+        pass
+
+    def DeleteKey(self, root, path):            # noqa: N802 - winreg naming
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        if any(other.startswith(path + "\\") for other in self.keys):
+            raise PermissionError("a key with subkeys cannot be deleted")
+        del self.keys[path]
 
 
 if __name__ == "__main__":

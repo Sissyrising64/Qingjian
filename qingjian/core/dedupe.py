@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from . import imaging, metadata
-from .work import WORKERS, mapped as _mapped
+from .work import mapped as _mapped
 from .safestore import Cancelled, fingerprint, sample_digest
 from .logsetup import get_logger
 

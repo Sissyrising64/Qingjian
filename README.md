@@ -44,8 +44,9 @@ Version **2.0.4** is the current tested build. The 2.0.4 maintenance release res
 
 1. Download the latest `Qingjian-2.0.4-Windows.zip` from the repository Releases page.
 2. Extract the archive to a local folder.
-3. Run `MediaSorter.exe`.
+3. Run `MediaSorter.exe` inside the extracted `MediaSorter` folder. Keep the folder together: the executable loads its libraries from beside it instead of unpacking them on every launch.
 4. Select a source folder, configure the key bindings, and start reviewing.
+5. Optional: turn on **Settings → General → Explorer folder menu** to right-click any folder and open it in Qingjian. If Qingjian is already open, it switches to that folder.
 
 The executable intentionally keeps the ASCII name `MediaSorter.exe`: some Windows native-window configurations have issues with non-ASCII executable names. The UI is still named **轻拣 / Qingjian**.
 
@@ -60,7 +61,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Build a standalone executable with PyInstaller:
+Build the Windows program with PyInstaller. The result is the folder `dist\MediaSorter`; ship the whole folder:
 
 ```powershell
 python -m PyInstaller --noconfirm --clean qingjian.spec
@@ -124,11 +125,11 @@ The `core` package is Qt-free and owns filesystem, metadata, duplicate, state, a
 | Shortcut | Action |
 | --- | --- |
 | `1`–`0` | Run the configured binding |
-| `Left` / `Right` | Previous / next item |
+| `Left` / `Right` | Previous / next item; hold to flip through quickly |
 | `S` | Send to review queue |
 | `G` | Toggle single/grid view |
 | `F2` | Rename |
-| `Delete` | Recycle |
+| `Delete` | Recycle at once, no confirmation (`Ctrl+Z` brings it back) |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` | Restore previous step |
 | `Shift+1`–`5`, `Shift+0` | Rating / clear rating |
@@ -139,6 +140,8 @@ The `core` package is Qt-free and owns filesystem, metadata, duplicate, state, a
 | `Ctrl+I` | Media information |
 | `Ctrl+R` | Review queue |
 | `F5` / `F11` / `Esc` | Rescan / fullscreen / leave fullscreen |
+
+Click a binding card to run it; right-click it to change its folder. A binding cannot take a key the window already uses (such as `G`, `S`, `J`/`K`/`L` or `M`): the key editor refuses it, because two shortcuts on one key would both stop working.
 
 ## Templates and file safety
 
@@ -152,10 +155,10 @@ Filename:    {YYYY-MM-DD}_{seq:4}_{name}
 The transaction store provides:
 
 - a durable journal written before file changes;
-- pre-operation identity checks to avoid overwriting externally changed files;
-- atomic same-volume moves where possible;
-- bounded recovery snapshots and cleanup policies;
-- reversible recycle-bin operations.
+- pre-operation identity checks (size and modification time) to avoid overwriting externally changed files;
+- atomic same-volume moves where possible, with content hashing reserved for bytes that are actually copied;
+- recycling that moves the file into a hidden `.qingjian-trash` folder beside it: instant, no copy, undone with `Ctrl+Z`, and cleared by the retention policy (or sent to the Windows recycle bin, if chosen in Settings);
+- bounded recovery snapshots and cleanup policies.
 
 If the application is interrupted, use the startup recovery action before continuing. Do not delete journal or snapshot files manually.
 
@@ -192,8 +195,7 @@ The core layer does not import Qt. The UI calls the engine layer instead of mani
 - `qingjian/core/` — Qt-free scanning, metadata, templates, transactions, state, and duplicate logic.
 - `qingjian/ui/` — PySide6 application, preview, dialogs, bindings, and duplicate review.
 - `tests/` — unit, integrity, media, and scale tests.
-- `功能修复说明.md` — 2.0.4 maintenance notes.
-- `打包测试报告.md` — build and verification report.
+- `docs/` — maintenance notes and reports, including `功能修复说明.md` (2.0.4 notes) and `打包测试报告.md` (build and verification report).
 
 ## Contributing
 
@@ -215,6 +217,8 @@ AI-generated suggestions were reviewed and integrated by the maintainer. The pro
 轻拣（Qingjian）是一款面向 Windows 的本地图片与视频快速分类工具。选择来源文件夹后，可以用 `1`–`0` 等快捷键把当前媒体移动、复制、收藏、重命名、回收或打标签，并自动进入下一项。
 
 主要功能包括：图片/视频预览、可配置按键与目标目录、路径和命名模板、同名文件 Replace/自动编号、伴随文件事务处理、查重与忽略、评分和色标、待复查队列，以及可恢复的撤销流程。2.0.4 还修复了启动时“撤销”和“恢复上一步”误亮的问题。
+
+使用要点：长按 ← → 可连续翻页；Delete 直接删除、不再确认，文件移到同盘的隐藏文件夹 `.qingjian-trash`，Ctrl+Z 即可恢复；单击按键卡片执行动作，右键卡片更换目标文件夹；在“设置 → 通用”里打开资源管理器右键菜单后，可以在文件夹上右键“用轻拣打开”。发布包是一个 `MediaSorter` 文件夹，请整个解压后运行其中的 `MediaSorter.exe`。
 
 本项目使用 AI 辅助开发：OpenAI Codex 负责当前版本的实现、测试和打包；Anthropic Claude 参与早期版本迭代；xAI Grok 提供 UI 评审建议；Impeccable、`frontend-design`、`web-design-guidelines`、`react-best-practices`、`shadcn` 和 `ui-ux-pro-max` 提供界面设计参考。所有改动均经过维护者审核和本地测试。
 

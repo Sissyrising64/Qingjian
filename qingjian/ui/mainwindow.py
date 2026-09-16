@@ -7,9 +7,10 @@ Deliberately thin: it draws, it listens for keys, and it asks
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
                                QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -37,6 +38,40 @@ from .widgets import (BindingCard, LabelSwatches, Segmented, StarRating, caption
                       icon_button, separator, text_button)
 
 log = get_logger("window")
+
+#: Thumbnail size shown while an arrow key is held: big enough to recognise a
+#: picture, small enough to decode between two key repeats.
+HOLD_EDGE = 480
+#: A held key normally ends with its release. This catches a release that went
+#: to another window, so the preview never stays on a soft stand-in.
+SETTLE_MS = 500
+
+
+class _ArrowKeys(QObject):
+    """Tells the window whether the arrow press it is handling is a key repeat.
+
+    QShortcut does not say. The key event that fired it does, and that event
+    passes the application's event filters on its way to the shortcut.
+    """
+
+    released = Signal()
+
+    ARROWS = (Qt.Key.Key_Left, Qt.Key.Key_Right)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.repeating = False
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        kind = event.type()
+        if kind in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            if event.key() in self.ARROWS:
+                self.repeating = event.isAutoRepeat()
+        elif kind == QEvent.Type.KeyRelease:
+            if event.key() in self.ARROWS and not event.isAutoRepeat():
+                self.repeating = False
+                self.released.emit()
+        return False
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +110,19 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 740)
         self.resize(1540, 940)
         self.setAcceptDrops(True)
+
+        # Holding an arrow key flips through what is already decoded; the item
+        # it is released on gets the full render. See `_arrow`.
+        self._arrows = _ArrowKeys(self)
+        QApplication.instance().installEventFilter(self._arrows)
+        self._arrows.released.connect(self._settle)
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(SETTLE_MS)
+        self._settle_timer.timeout.connect(self._settle)
+        self._settle_pending = False
+        self._flipped: deque[str] = deque(maxlen=4)
+        self.thumbs.ready.connect(self._flip_arrived)
 
         self._build()
         self._build_shortcuts()
@@ -264,7 +312,14 @@ class MainWindow(QMainWindow):
         self.grid_size.setRange(96, 320)
         self.grid_size.setValue(168)
         self.grid_size.setFixedWidth(120)
-        self.grid_size.valueChanged.connect(lambda value: self.grid.set_edge(value))
+        # Resizing rebuilds every row of the grid. Doing that on each tick of a
+        # drag cost 69 ms a tick with five thousand items, so wait for a pause.
+        self._grid_size_timer = QTimer(self)
+        self._grid_size_timer.setSingleShot(True)
+        self._grid_size_timer.setInterval(150)
+        self._grid_size_timer.timeout.connect(self._apply_grid_size)
+        self.grid_size.valueChanged.connect(lambda _value: self._grid_size_timer.start())
+        self.grid_size.sliderReleased.connect(self._apply_grid_size)
         row.addWidget(QLabel(""))
         row.addWidget(self.grid_size)
         row.addWidget(separator())
@@ -287,6 +342,10 @@ class MainWindow(QMainWindow):
         for widget in (self.select_all_button, self.invert_button, self.clear_selection_button):
             row.addWidget(widget)
         return row
+
+    def _apply_grid_size(self) -> None:
+        self._grid_size_timer.stop()
+        self.grid.set_edge(self.grid_size.value())
 
     def _build_metadata_bar(self) -> QFrame:
         bar = QFrame()
@@ -446,6 +505,12 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel(tr("status.ready"))
         self.status_label.setObjectName("statusBar")
         row.addWidget(self.status_label)
+        # Copying or favouriting marks a file handled and hides it from every
+        # later queue; this is the way back.
+        self.handled_button = text_button("", "compactButton")
+        self.handled_button.setVisible(False)
+        self.handled_button.clicked.connect(self.reveal_handled)
+        row.addWidget(self.handled_button)
         row.addStretch(1)
         self.queue_label = QLabel("")
         self.queue_label.setObjectName("statusBar")
@@ -469,16 +534,15 @@ class MainWindow(QMainWindow):
         return row
 
     # ============================================================ shortcuts
-    def _shortcut(self, sequence: str, handler) -> QShortcut:
+    def _shortcut(self, sequence: str, handler, repeat: bool = False) -> QShortcut:
         item = QShortcut(QKeySequence(sequence), self)
         item.setContext(Qt.ShortcutContext.WindowShortcut)
-        item.setAutoRepeat(False)
+        item.setAutoRepeat(repeat)
         item.activated.connect(handler)
         return item
 
     def _build_shortcuts(self) -> None:
         pairs = [
-            ("Left", lambda: self.step(-1)), ("Right", lambda: self.step(1)),
             ("Ctrl+Z", self.undo), ("Ctrl+Y", self.redo), ("Ctrl+Shift+Z", self.redo),
             ("F5", self.rescan), ("F11", self.toggle_fullscreen),
             ("Space", self.preview.toggle_play), ("K", self.preview.toggle_play),
@@ -494,6 +558,9 @@ class MainWindow(QMainWindow):
         ]
         self._fixed_shortcuts = [self._shortcut(sequence, handler)
                                  for sequence, handler in pairs]
+        # The only keys that repeat while held: see `_arrow`.
+        self._fixed_shortcuts.append(self._shortcut("Left", lambda: self._arrow(-1), repeat=True))
+        self._fixed_shortcuts.append(self._shortcut("Right", lambda: self._arrow(1), repeat=True))
         for value in range(1, 6):
             self._fixed_shortcuts.append(
                 self._shortcut(f"Shift+{value}", lambda v=value: self._rate_current(v)))
@@ -505,16 +572,25 @@ class MainWindow(QMainWindow):
         self._fixed_shortcuts.append(escape)
         self._install_binding_shortcuts()
 
+    def reserved_keys(self) -> list[str]:
+        """Keys the window itself answers to, which no binding may take."""
+        return [item.key().toString() for item in self._fixed_shortcuts]
+
     def _install_binding_shortcuts(self) -> None:
         for item in self._binding_shortcuts:
             item.setEnabled(False)
             item.deleteLater()
         self._binding_shortcuts.clear()
+        # Two shortcuts on one key fire neither. A clash saved before the key
+        # editor refused them keeps the built-in key and says so.
+        clashes = config.reserved_conflicts(self.settings.bindings, self.reserved_keys())
         for index, binding in enumerate(self.settings.bindings):
-            if not binding.key:
+            if not binding.key or binding.key in clashes:
                 continue
             self._binding_shortcuts.append(
                 self._shortcut(binding.key, lambda i=index: self.classify_index(i)))
+        if clashes:
+            self.status(tr("status.reserved_key", keys=", ".join(clashes)), "warning")
 
     def _escape(self) -> None:
         if self.isFullScreen():
@@ -694,8 +770,28 @@ class MainWindow(QMainWindow):
         self._refresh_browsers()
         self._refresh_view()
         self._update_quota()
+        self._update_handled()
         if message:
             self.status(message, "success")
+
+    def _update_handled(self) -> None:
+        count = self.engine.hidden_handled()
+        self.handled_button.setText(tr("status.hidden_handled", count=count))
+        self.handled_button.setVisible(count > 0)
+
+    def reveal_handled(self) -> None:
+        if self._blocked() or not self.engine.source_root:
+            return
+        # A copy still in the queue would mark its file again behind this.
+        if not self._drain_queue():
+            return
+        try:
+            count = self._with_progress(
+                tr("scan.filtering"),
+                lambda progress, cancel: self.engine.reveal_handled(progress, cancel))
+        except Cancelled:
+            return
+        self._after_queue_change(tr("status.handled_revealed", count=count))
 
     def _refresh_browsers(self) -> None:
         paths = self.engine.queue_paths
@@ -749,6 +845,67 @@ class MainWindow(QMainWindow):
         if self.engine.step(offset) is not None:
             self._refresh_view()
 
+    def _arrow(self, offset: int) -> None:
+        """Left and Right. A tap renders in full; a held key flips.
+
+        Key repeats arrive thirty times a second and a full render decodes a
+        photograph, so holding the key used to be switched off altogether.
+        """
+        if not self._arrows.repeating:
+            self.step(offset)
+            return
+        if self.view_mode != config.VIEW_SINGLE:
+            return                  # the grid shows no cursor for a held key to move
+        if self.engine.step(offset) is not None:
+            self._flip()
+
+    def _flip(self) -> None:
+        """One repeat of a held arrow key: move on and show only what is in hand.
+
+        The counter, the name, the filmstrip cursor and a picture that is
+        already decoded. Anything that reads metadata, queries the database or
+        decodes on this thread waits for `_settle`.
+        """
+        path = self.engine.current_path()
+        if path is None:
+            return
+        self.counter_label.setText(f"{self.engine.index + 1} / {len(self.engine.queue_paths)}")
+        elide(self.filename_label, path.name, max(160, self.filename_label.width()))
+        self.detail_label.setText("")
+        self.sidecar_badge.setVisible(False)
+        self.filmstrip.follow(self.engine.index)
+        self._flipped.append(str(path))
+        pixmap = self.preloader.take(path, self._preview_target())
+        if pixmap is None:
+            pixmap = self.thumbs.peek(path, HOLD_EDGE)
+        if pixmap is not None:
+            self.preview.show_still(path, pixmap)
+        else:
+            # Decode on a worker. Only the last few items stay wanted, so a long
+            # hold never leaves a backlog behind it.
+            self.thumbs.set_wanted(self._flipped, HOLD_EDGE)
+            self.thumbs.request(path, HOLD_EDGE)
+        self._settle_pending = True
+        self._settle_timer.start()
+
+    def _flip_arrived(self, path: str, edge: int, pixmap) -> None:
+        """A held-key thumbnail landed. Show it if the flip has not gone far past it."""
+        if edge != HOLD_EDGE or not self._settle_pending or path not in self._flipped:
+            return
+        self.preview.show_still(Path(path), pixmap)
+
+    def _settle(self) -> None:
+        """The arrow key was let go: render the item it stopped on, in full."""
+        if not self._settle_pending:
+            return
+        if QApplication.activeModalWidget() is not None:
+            self._settle_timer.start()      # after the dialog, not decoding behind it
+            return
+        self._flipped.clear()
+        if self.view_mode == config.VIEW_SINGLE:
+            self._refresh_view()
+        self._settle_pending = False
+
     def _filmstrip_selected(self, path: str) -> None:
         if self.engine.go_to(path):
             self._refresh_view(scroll_strip=False)
@@ -766,6 +923,9 @@ class MainWindow(QMainWindow):
         self.side_title.setText(tr("side.bulk_title") if count > 1 else tr("side.title"))
 
     def _refresh_view(self, scroll_strip: bool = True) -> None:
+        # A full render supersedes whatever a held arrow key left pending.
+        self._settle_pending = False
+        self._settle_timer.stop()
         path = self.engine.current_path()
         total = len(self.engine.queue_paths)
         self.counter_label.setText(f"{self.engine.index + 1 if total else 0} / {total}")
@@ -1101,7 +1261,8 @@ class MainWindow(QMainWindow):
     def open_bindings(self) -> None:
         if self._blocked():
             return
-        dialog = BindingsDialog(self.settings.bindings, self._template_samples(), self)
+        dialog = BindingsDialog(self.settings.bindings, self._template_samples(), self,
+                                reserved=self.reserved_keys())
         if self._run_dialog(dialog) == QDialog.DialogCode.Accepted:
             self.settings.set_bindings(dialog.result_bindings())
             self.engine.save_settings()
@@ -1156,7 +1317,8 @@ class MainWindow(QMainWindow):
             if rules.prompt in (PROMPT_EACH, PROMPT_ONCE):
                 target = self.engine.preview_target(binding, path, group)
                 dialog = SidecarDialog(group, target.name if target else path.name,
-                                       str(target.parent) if target else binding.folder, self)
+                                       str(target.parent) if target else binding.folder, self,
+                                       remember=rules.prompt == PROMPT_ONCE)
                 accepted = self._run_dialog(dialog) == QDialog.DialogCode.Accepted
                 if not accepted:
                     return
@@ -1184,11 +1346,8 @@ class MainWindow(QMainWindow):
                 if decision == ops.CONFLICT_SKIP:
                     self.status(tr("skip"), "normal")
                     return
-        if binding.action == "trash":
-            if QMessageBox.question(
-                    self, tr("action.trash"), path.name) != QMessageBox.StandardButton.Yes:
-                return
-
+        # Recycling asks nothing: Ctrl+Z brings the file straight back, and a
+        # question per file turned a grid selection into a row of dialogs.
         resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
         self._run_operation(
             path,
@@ -1271,6 +1430,7 @@ class MainWindow(QMainWindow):
         self._refresh_bindings()
         self._update_actions()
         self._update_quota()
+        self._update_handled()
 
     def _on_queue_event(self, event: str, job) -> None:
         pending = self.engine.queue.pending
@@ -1355,9 +1515,6 @@ class MainWindow(QMainWindow):
         path = self.engine.current_path()
         if path is None:
             return
-        if QMessageBox.question(self, tr("action.trash"),
-                                path.name) != QMessageBox.StandardButton.Yes:
-            return
         self._run_operation(path,
                             lambda progress, cancel: self.engine.trash(path, progress, cancel),
                             f"{tr('action.trash')} · {path.name}")
@@ -1437,6 +1594,7 @@ class MainWindow(QMainWindow):
         self._apply_change(change)
         self.count_pill.setText(tr("header.item_count", count=len(self.engine.all_files)))
         self._update_quota()
+        self._update_handled()
         self.status(message, "success")
         self._refresh_bindings()
 
@@ -1641,6 +1799,15 @@ class MainWindow(QMainWindow):
             dialog.close()
             dialog.deleteLater()
 
+    def open_requested(self, folder: str) -> None:
+        """A later launch -- Explorer's "Open with Qingjian" -- handed over a folder."""
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if folder and Path(folder).is_dir():
+            self.open_folder(Path(folder))
+
     # -- drag and drop --------------------------------------------------
     def dragEnterEvent(self, event) -> None:      # noqa: N802 - Qt naming
         if event.mimeData().hasUrls():
@@ -1688,6 +1855,7 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return
+        QApplication.instance().removeEventFilter(self._arrows)
         self.preview.release()
         self.preloader.shutdown()
         self.thumbs.shutdown()

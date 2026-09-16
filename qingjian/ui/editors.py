@@ -1,6 +1,7 @@
 """Editors: key bindings, path templates and application settings."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -9,7 +10,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog, 
                                QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
                                QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
 
-from ..core import config, template
+from ..core import config, platform_, template
 from ..core.engine import human_size
 from ..core.i18n import LANGUAGES, tr
 from ..core.naming import NameError_
@@ -205,11 +206,14 @@ class TemplateEditor(QDialog):
 class BindingsDialog(QDialog):
     """The ten keys, what each does and where it sends things."""
 
-    def __init__(self, bindings: list[config.Binding], samples=None, parent=None) -> None:
+    def __init__(self, bindings: list[config.Binding], samples=None, parent=None,
+                 reserved=()) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr("bind.title"))
         self.setMinimumSize(940, 640)
         self.samples = samples or []
+        #: Keys the window already answers to; a binding on one would be dead.
+        self.reserved = list(reserved)
         self._working = [config.Binding(**b.to_dict()) for b in bindings]
         self.rows: list[dict] = []
 
@@ -333,6 +337,11 @@ class BindingsDialog(QDialog):
         if clashes:
             QMessageBox.warning(self, tr("error.title"),
                                 tr("bind.duplicate_key", key=", ".join(clashes)))
+            return
+        taken = config.reserved_conflicts(self._working, self.reserved)
+        if taken:
+            QMessageBox.warning(self, tr("error.title"),
+                                tr("bind.reserved_key", key=", ".join(taken)))
             return
         self.accept()
 
@@ -460,6 +469,13 @@ class SettingsDialog(QDialog):
                             [(config.VIEW_SINGLE, tr("view.single")),
                              (config.VIEW_GRID, tr("view.grid"))],
                             self.settings.default_view)))
+        if platform_.IS_WINDOWS:
+            # The registry is the setting: read it rather than keep a copy that
+            # could disagree with what Explorer actually shows.
+            self._folder_menu_was = platform_.folder_menu_installed()
+            card.add_row(SettingRow(
+                tr("settings.folder_menu"), tr("settings.folder_menu.desc"),
+                self._switch("folder_menu", self._folder_menu_was)))
         layout.addWidget(card)
         layout.addStretch(1)
         return page
@@ -627,6 +643,16 @@ class SettingsDialog(QDialog):
             extra_extensions=rules.extra_extensions,
             link_same_stem_media=rules.link_same_stem_media,
             hide_from_queue=get("sidecar_hide").isChecked())
+
+        menu = get("folder_menu")
+        if menu is not None and menu.isChecked() != self._folder_menu_was:
+            script = Path(__file__).resolve().parents[2] / "main.py"
+            command = platform_.launch_command(getattr(sys, "frozen", False), sys.executable,
+                                               str(script))
+            try:
+                platform_.set_folder_menu(menu.isChecked(), tr("app.open_with"), command)
+            except OSError as error:
+                QMessageBox.warning(self, tr("error.title"), str(error))
         self.accept()
 
     def result_settings(self) -> config.Settings:

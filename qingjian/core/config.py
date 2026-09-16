@@ -77,6 +77,17 @@ def default_bindings() -> list[Binding]:
     return [Binding(key=key) for key in DEFAULT_KEYS]
 
 
+def reserved_conflicts(bindings, reserved) -> list[str]:
+    """Binding keys the window already answers to, in binding order.
+
+    Qt treats two shortcuts on one key as ambiguous and fires neither, so a
+    folder bound to G -- which is grid view -- silently did nothing at all.
+    """
+    taken = {str(key).casefold() for key in reserved if key}
+    return [binding.key for binding in bindings
+            if binding.key and binding.key.casefold() in taken]
+
+
 @dataclass
 class Settings:
     # interface

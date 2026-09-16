@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 from base import TempCase, unittest
@@ -5,7 +6,7 @@ from fixtures import build_library
 from qingjian.core import config, dedupe, mediatypes, scanner
 from qingjian.core.engine import Engine, human_size
 from qingjian.core.opqueue import Job, OperationQueue
-from qingjian.core.safestore import Cancelled
+from qingjian.core.safestore import Cancelled, SafeStore
 from qingjian.core.sidecar import SidecarRules
 from qingjian.core.state import StateStore
 
@@ -104,6 +105,28 @@ class ScannerTests(TempCase):
         forward = scanner.sort_paths(self.deep, "name")
         backward = scanner.sort_paths(self.deep, "name", reverse=True)
         self.assertEqual(forward, list(reversed(backward)))
+
+    def test_equal_keys_fall_back_to_the_name(self):
+        """Files copied in one go share a timestamp, and often a size.
+
+        With no second key their order was whatever order the list arrived in,
+        so undo put a file back somewhere a full sort would not have.
+        """
+        folder = self.tmp / "same"
+        paths = [self.write(folder / name, b"same size")
+                 for name in ("b10.jpg", "a.jpg", "b2.jpg")]
+        for path in paths:
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+        orders = {
+            "modified": scanner.sort_paths(paths, "modified"),
+            "size": scanner.sort_paths(paths, "size"),
+            "date": scanner.sort_paths(paths, "date", capture_time=lambda p: 5.0),
+        }
+        for mode, ordered in orders.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(["a.jpg", "b2.jpg", "b10.jpg"], [p.name for p in ordered])
+        self.assertEqual(["b10.jpg", "b2.jpg", "a.jpg"],
+                         [p.name for p in scanner.sort_paths(paths, "modified", reverse=True)])
 
     def test_random_is_reproducible_with_a_seed(self):
         first = scanner.sort_paths(self.deep, "random", seed=5)
@@ -207,6 +230,41 @@ class EngineTests(TempCase):
         self.engine.rebuild_queue()
         self.assertNotIn(source, self.engine.queue_paths)
 
+    def test_moving_and_undoing_read_no_file_content(self):
+        """A rename has no copy to prove.
+
+        Hashing the source before and during every move read the whole file
+        twice for a directory-entry change: half a second for a 300 MB video,
+        and the same again on undo.
+        """
+        self.assertEqual("full", self.engine.settings.verification)
+        hashed = self.count_hashes()
+        self.engine.go_to(self.root / "Day4" / "solo_01.JPG")
+        self.engine.classify(self.engine.settings.bindings[0])
+        self.engine.undo()
+        self.assertTrue((self.root / "Day4" / "solo_01.JPG").exists())
+        self.assertEqual([], hashed)
+
+    def test_copying_hashes_only_the_copy(self):
+        """Full verification still proves the copy byte for byte, once."""
+        hashed = self.count_hashes()
+        self.engine.go_to(self.root / "Day4" / "solo_01.JPG")
+        self.engine.classify(self.engine.settings.bindings[1])
+        self.assertTrue((self.tmp / "Deliver" / "solo_01.JPG").exists())
+        self.assertEqual(1, len(hashed), hashed)
+        self.assertTrue(hashed[0].endswith(".part"), hashed)
+
+    def test_copied_files_can_be_shown_again(self):
+        """Copying marks the original handled, which hid it for good."""
+        source = self.root / "Day4" / "solo_01.JPG"
+        self.engine.go_to(source)
+        self.engine.classify(self.engine.settings.bindings[1])
+        self.engine.rebuild_queue()
+        self.assertEqual(1, self.engine.hidden_handled())
+        self.engine.reveal_handled()
+        self.assertIn(source, self.engine.queue_paths)
+        self.assertEqual(0, self.engine.hidden_handled())
+
     def test_the_cursor_survives_a_rebuild(self):
         self.engine.go_to(self.root / "Day4" / "solo_02.JPG")
         current = self.engine.current_path()
@@ -265,6 +323,52 @@ class EngineTests(TempCase):
         before = extra.path.read_bytes()
         self.engine.ignore_duplicates([extra])
         self.assertEqual(before, extra.path.read_bytes())
+
+    def test_recycling_renames_into_a_hidden_folder_beside_the_file(self):
+        """No copy and no hash: a rename on the same disk, undone by renaming back."""
+        target = self.root / "Day4" / "solo_01.JPG"
+        content = target.read_bytes()
+        hashed = self.count_hashes()
+        self.engine.go_to(target)
+        outcome = self.engine.trash()
+        trash = self.root / "Day4" / ".qingjian-trash"
+        self.assertFalse(target.exists())
+        self.assertEqual(1, len(list(trash.iterdir())))
+        self.assertEqual([], list(self.engine.store.snapshot_root.iterdir()),
+                         "a restore copy was written")
+        self.assertEqual([], hashed)
+        self.engine.absorb(outcome.record)
+        self.assertFalse(any(".qingjian-trash" in p.parts for p in self.engine.all_files))
+        self.engine.undo()
+        self.assertEqual(content, target.read_bytes())
+        self.assertEqual([], list(trash.iterdir()))
+
+    def test_recycled_files_count_as_restore_space_until_reclaimed(self):
+        target = self.root / "Day4" / "solo_02.JPG"
+        size = target.stat().st_size
+        trash = self.root / "Day4" / ".qingjian-trash"
+        self.engine.go_to(target)
+        self.engine.trash()
+        self.assertTrue(trash.is_dir())
+        self.assertEqual(size, self.engine.backup_usage())
+        self.assertEqual(size, SafeStore(self.data / "store").usage(), "lost after a restart")
+        self.engine.settings.quota = self.engine.settings.quota.__class__(
+            max_operations=0, max_bytes=1, max_days=0, automatic=False)
+        freed, retired = self.engine.reclaim(force=True)
+        self.assertEqual((size, 1), (freed, retired))
+        self.assertEqual(0, self.engine.backup_usage())
+        self.assertFalse(trash.exists(), "the emptied hidden folder was left behind")
+
+    def test_recycling_falls_back_to_a_copy_where_the_folder_cannot_be_made(self):
+        folder = self.root / "Day4"
+        self.write(folder / ".qingjian-trash", b"a file where the folder would go")
+        target = folder / "solo_03.JPG"
+        content = target.read_bytes()
+        self.engine.go_to(target)
+        self.engine.trash()
+        self.assertFalse(target.exists())
+        self.engine.undo()
+        self.assertEqual(content, target.read_bytes())
 
     def test_reclaim_retires_the_oldest_records(self):
         self.engine.settings.quota = self.engine.settings.quota.__class__(
