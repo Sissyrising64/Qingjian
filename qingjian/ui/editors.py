@@ -115,7 +115,7 @@ class TemplateEditor(QDialog):
         header.addWidget(self.status)
         preview_layout.addLayout(header)
         self.preview = QListWidget()
-        self.preview.setObjectName("navList")
+        self.preview.setObjectName("previewList")
         preview_layout.addWidget(self.preview, 1)
         layout.addWidget(preview_card, 1)
 
@@ -141,7 +141,7 @@ class TemplateEditor(QDialog):
     @staticmethod
     def _label(text: str) -> QLabel:
         label = QLabel(text)
-        label.setStyleSheet("font-weight: 650; color: #DCE1EC;")
+        label.setObjectName("rowTitle")
         return label
 
     def _chips(self, tokens, target: QLineEdit) -> QWidget:
@@ -169,10 +169,10 @@ class TemplateEditor(QDialog):
         try:
             template.validate(path_template, name_template)
             self.status.setText(tr("tpl.valid"))
-            self.status.setStyleSheet(f"color: {theme.OK};")
+            self.status.setStyleSheet(f"color: {theme.BALLPOINT_LIGHT};")
         except NameError_ as error:
             self.status.setText(tr("tpl.invalid", error=tr(error.key, **error.fields)))
-            self.status.setStyleSheet(f"color: {theme.ERROR};")
+            self.status.setStyleSheet(f"color: {theme.GREASE};")
             self.preview.clear()
             return
 
@@ -259,11 +259,6 @@ class BindingsDialog(QDialog):
         line.setContentsMargins(12, 10, 10, 10)
         line.setSpacing(9)
 
-        number = QLabel(f"{index + 1:02d}")
-        number.setObjectName("rowNumber")
-        number.setFixedWidth(26)
-        line.addWidget(number)
-
         key_edit = ShortcutEdit(binding.key)
         key_edit.setFixedWidth(84)
         line.addWidget(key_edit)
@@ -281,7 +276,7 @@ class BindingsDialog(QDialog):
         line.addWidget(folder, 1)
 
         browse = QPushButton(tr("browse"))
-        browse.setObjectName("browseButton")
+        browse.setObjectName("compactButton")
         browse.clicked.connect(lambda _=False, edit=folder, key=binding.key: self._browse(edit, key))
         line.addWidget(browse)
 
@@ -388,7 +383,7 @@ class SettingsDialog(QDialog):
             ("settings.nav.performance", "sliders", self._page_performance),
             ("settings.nav.about", "info", self._page_about),
         ):
-            item = QListWidgetItem(icons.icon(icon_name, 16, "#A594FF"), tr(key))
+            item = QListWidgetItem(icons.icon(icon_name, 16, theme.PAPER_DIM), tr(key))
             self.nav.addItem(item)
             page = QScrollArea()
             page.setWidgetResizable(True)
@@ -422,8 +417,8 @@ class SettingsDialog(QDialog):
         layout.setSpacing(14)
         return page, layout
 
-    def _segmented(self, key: str, options, value: str, primary: bool = False) -> Segmented:
-        widget = Segmented(options, primary=primary)
+    def _segmented(self, key: str, options, value: str) -> Segmented:
+        widget = Segmented(options)
         widget.set_value(value, quiet=True)
         self._controls[key] = widget
         return widget
@@ -451,7 +446,7 @@ class SettingsDialog(QDialog):
             self._segmented("language",
                             [(code, name) for code, name in LANGUAGES]
                             + [("system", tr("settings.language.system"))],
-                            self.settings.language, primary=True),
+                            self.settings.language),
             first=True))
         card.add_row(SettingRow(
             tr("settings.density"), tr("settings.density.desc"),

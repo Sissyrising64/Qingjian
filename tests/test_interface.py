@@ -420,5 +420,125 @@ class FolderMenuSettingTests(WindowCase):
         self.assertEqual([], calls)
 
 
+class BaggingTests(WindowCase):
+    """The copy that drops into an envelope must never cover the next print."""
+
+    def setUp(self):
+        super().setUp()
+        self.window._motion = True          # the machine's own setting must not decide this
+
+    def test_a_later_filing_never_shows_the_last_print_at_full_size(self):
+        """Setting a drop's end points on the stopped animation reported a final
+        frame, and the copy appeared over the next print. It takes a different
+        envelope from the last drop: moving the end point is what reports it."""
+        from PySide6.QtCore import QAbstractAnimation
+        self.window._drop(self.window._binding_cards[1], self.window._take_off())
+        self.window._fall.setCurrentTime(self.window._fall.duration())
+        self.assertEqual(QAbstractAnimation.State.Stopped, self.window._fall.state())
+
+        self.window._drop(self.window._binding_cards[2], self.window._take_off())
+        self.assertFalse(self.window._flyer.isVisible())
+
+    def test_the_copy_appears_only_once_it_is_under_half_size(self):
+        flight = self.window._take_off()
+        self.window._drop(self.window._binding_cards[1], flight)
+        fall = self.window._fall
+        fall.pause()
+        fall.setCurrentTime(1)
+        self.assertFalse(self.window._flyer.isVisible())
+        fall.setCurrentTime(fall.duration() // 3)
+        self.assertTrue(self.window._flyer.isVisible())
+        self.assertLess(self.window._flyer.width(), flight[1].width() / 2)
+
+
+class NoAnimationTests(WindowCase):
+    """With Windows' "show animations" turned off, nothing on the counter animates."""
+
+    def setUp(self):
+        from qingjian.core import platform_
+        self.patch(platform_, "animations_enabled", lambda: False)
+        super().setUp()
+
+    def test_filing_stamps_the_envelope_without_animating(self):
+        from PySide6.QtCore import QAbstractAnimation
+        card = self.window._binding_cards[0]
+        self.window.classify_index(0)
+        self.app.processEvents()
+        self.assertIsNone(self.window._flyer)
+        self.assertEqual(QAbstractAnimation.State.Stopped, card._stamp_animation.state())
+        self.assertGreater(card._stamp, 0)
+
+    def test_hovering_an_envelope_lifts_it_without_animating(self):
+        from PySide6.QtCore import QAbstractAnimation
+        from PySide6.QtGui import QEnterEvent
+        card = self.window._binding_cards[0]
+        point = QPointF(5, 5)
+        QApplication.sendEvent(card, QEnterEvent(point, point, point))
+        self.assertEqual(QAbstractAnimation.State.Stopped, card._lift_animation.state())
+        self.assertEqual(1.0, card._lift)
+
+
+class NarrowWindowTests(WindowCase):
+    """The smallest window keeps the words that matter; a wide one gives up nothing."""
+
+    def setUp(self):
+        super().setUp()
+        from qingjian.core.i18n import get_language, set_language
+        self.addCleanup(set_language, get_language())
+        self.window._change_language("en")          # the longer language is the harder case
+
+    def show_at(self, width: int, height: int) -> None:
+        self.window.resize(width, height)
+        QTest.qWait(50)
+
+    def test_no_row_is_squeezed_below_its_own_minimum_in_the_smallest_window(self):
+        """An explicit window minimum lets Qt overlap widgets instead of growing."""
+        for language in ("en", "zh"):
+            with self.subTest(language=language):
+                self.window._change_language(language)
+                self.show_at(1180, 740)
+                central = self.window.centralWidget()
+                self.assertLessEqual(central.layout().minimumSize().width(), central.width())
+
+    def test_the_last_filing_stays_readable_in_the_smallest_window(self):
+        """With the long "show hidden files again" button competing for the same row."""
+        from qingjian.core.i18n import tr
+        self.window.handled_button.setText(tr("status.hidden_handled", count=12))
+        self.window.handled_button.setVisible(True)
+        self.show_at(1180, 740)
+        message = tr("status.done_action", action=tr("action.move"), name="IMG_0007.JPG")
+        self.window.status(message, "success")
+        QTest.qWait(20)
+        label = self.window.status_label
+        self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(message))
+
+    def test_the_snapshot_bar_never_shows_without_its_figures(self):
+        for width in (1180, 1540, 1920):
+            with self.subTest(width=width):
+                self.show_at(width, 900)
+                self.assertEqual(self.window.quota_label.isVisible(),
+                                 self.window.quota_bar.isVisible())
+
+    def test_a_wide_window_gives_up_nothing(self):
+        from qingjian.core.i18n import tr
+        self.show_at(1920, 1030)
+        window = self.window
+        self.assertTrue(window.preset_label.isVisible())
+        self.assertTrue(window.quota_label.isVisible())
+        self.assertEqual(tr("side.search_targets"), window.search_edit.placeholderText())
+        self.assertEqual(tr("header.choose_folder"), window.choose_button.text())
+        self.assertEqual(tr("scan.recursive"), window.recursive_check.text())
+
+
+class StampsFollowTheViewTests(WindowCase):
+    def test_the_rating_stars_are_on_screen_in_either_view(self):
+        from qingjian.core import config
+        for mode in (config.VIEW_GRID, config.VIEW_SINGLE, config.VIEW_GRID):
+            with self.subTest(view=mode):
+                self.window._set_view(mode)
+                self.app.processEvents()
+                self.assertTrue(self.window.rating.isVisible())
+
+
 if __name__ == "__main__":
     unittest.main()

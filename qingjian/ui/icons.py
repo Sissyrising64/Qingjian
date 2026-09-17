@@ -69,12 +69,22 @@ _SHAPES: dict[str, dict] = {
              "paths": [[(15.5, 9.5), (20.5, 14.5)], [(20.5, 9.5), (15.5, 14.5)]]},
     "sliders": {"paths": [[(4, 7), (20, 7)], [(4, 12), (20, 12)], [(4, 17), (20, 17)]],
                 "circles": [(9, 7, 2.2), (15, 12, 2.2), (7, 17, 2.2)]},
+    "reverse": {"paths": [[(8, 4.5), (8, 19.5)], [(4.5, 8), (8, 4.5), (11.5, 8)],
+                          [(16, 19.5), (16, 4.5)], [(12.5, 16), (16, 19.5), (19.5, 16)]]},
+    "more": {"discs": [(5.5, 12, 1.6), (12, 12, 1.6), (18.5, 12, 1.6)]},
+    "keyboard": {"rects": [(2.5, 6, 19, 12, 2)],
+                 "paths": [[(6, 10), (6.2, 10)], [(9.3, 10), (9.5, 10)], [(12.6, 10), (12.8, 10)],
+                           [(15.9, 10), (16.1, 10)], [(8, 14), (16, 14)]]},
+    "edit": {"paths": [[(4, 20), (4.6, 16), (15.5, 5), (19, 8.5), (8, 19.4), (4, 20)],
+                       [(13, 7.5), (16.5, 11)]]},
+    "subfolders": {"paths": [[(5, 3.5), (5, 17.5)], [(5, 8.5), (10, 8.5)], [(5, 17.5), (10, 17.5)]],
+                   "rects": [(10.5, 5.5, 10, 6, 1.2), (10.5, 14.5, 10, 6, 1.2)]},
 }
 
 _CACHE: dict[tuple, QIcon] = {}
 
 
-def pixmap(name: str, size: int = 18, color: str = "#C7CEDC", width: float = 1.9,
+def pixmap(name: str, size: int = 18, color: str = "#BDB3A4", width: float = 1.7,
            ratio: float = 1.0) -> QPixmap:
     shapes = _SHAPES.get(name)
     canvas = QPixmap(int(size * ratio), int(size * ratio))
@@ -106,20 +116,22 @@ def pixmap(name: str, size: int = 18, color: str = "#C7CEDC", width: float = 1.9
         painter.drawRoundedRect(QRectF(x, y, w, h), radius, radius)
     for x, y, w, h, start, span in shapes.get("arcs", ()):
         painter.drawArc(QRectF(x, y, w, h), int(start), int(span))
-    if shapes.get("fills"):
+    if shapes.get("fills") or shapes.get("discs"):
         painter.setBrush(QColor(color))
         painter.setPen(Qt.PenStyle.NoPen)
-        for points in shapes["fills"]:
+        for points in shapes.get("fills", ()):
             path = QPainterPath(QPointF(*points[0]))
             for point in points[1:]:
                 path.lineTo(QPointF(*point))
             path.closeSubpath()
             painter.drawPath(path)
+        for cx, cy, radius in shapes.get("discs", ()):
+            painter.drawEllipse(QPointF(cx, cy), radius, radius)
     painter.end()
     return canvas
 
 
-def icon(name: str, size: int = 18, color: str = "#C7CEDC", width: float = 1.9) -> QIcon:
+def icon(name: str, size: int = 18, color: str = "#BDB3A4", width: float = 1.7) -> QIcon:
     key = (name, size, color, width)
     cached = _CACHE.get(key)
     if cached is None:
@@ -129,28 +141,50 @@ def icon(name: str, size: int = 18, color: str = "#C7CEDC", width: float = 1.9) 
 
 
 def app_icon(size: int = 256) -> QIcon:
-    """The window and taskbar icon: a card with a picture in it."""
+    """The window and taskbar icon: a print going into a kraft envelope."""
     canvas = QPixmap(size, size)
     canvas.fill(Qt.GlobalColor.transparent)
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    s = float(size)
     background = QPainterPath()
-    background.addRoundedRect(QRectF(size * 0.04, size * 0.04, size * 0.92, size * 0.92),
-                              size * 0.22, size * 0.22)
-    painter.fillPath(background, QColor("#7357F5"))
-    card = QPainterPath()
-    card.addRoundedRect(QRectF(size * 0.23, size * 0.22, size * 0.54, size * 0.56),
-                        size * 0.085, size * 0.085)
-    painter.fillPath(card, QColor("#F4F1FF"))
+    background.addRoundedRect(QRectF(s * 0.04, s * 0.04, s * 0.92, s * 0.92), s * 0.2, s * 0.2)
+    painter.fillPath(background, QColor("#1C1916"))
+
+    # The print, standing a little crooked out of the envelope.
+    painter.save()
+    painter.translate(s * 0.5, s * 0.42)
+    painter.rotate(-7)
+    paper = QRectF(-s * 0.25, -s * 0.28, s * 0.5, s * 0.46)
+    painter.fillRect(paper, QColor("#EFE9DD"))
+    photo = paper.adjusted(s * 0.035, s * 0.035, -s * 0.035, -s * 0.035)
+    painter.fillRect(photo, QColor("#3E5B6B"))
+    hill = QPainterPath(QPointF(photo.left(), photo.bottom() - photo.height() * 0.28))
+    hill.lineTo(QPointF(photo.left() + photo.width() * 0.38, photo.top() + photo.height() * 0.45))
+    hill.lineTo(QPointF(photo.left() + photo.width() * 0.62, photo.top() + photo.height() * 0.62))
+    hill.lineTo(QPointF(photo.right(), photo.top() + photo.height() * 0.4))
+    hill.lineTo(photo.bottomRight())
+    hill.lineTo(photo.bottomLeft())
+    hill.closeSubpath()
+    painter.fillPath(hill, QColor("#6F8F63"))
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#7357F5"))
-    painter.drawEllipse(QRectF(size * 0.32, size * 0.32, size * 0.12, size * 0.12))
-    mountain = QPainterPath()
-    mountain.moveTo(size * 0.29, size * 0.67)
-    for point in ((0.45, 0.49), (0.56, 0.60), (0.64, 0.52), (0.72, 0.67)):
-        mountain.lineTo(size * point[0], size * point[1])
-    mountain.closeSubpath()
-    painter.fillPath(mountain, QColor("#7357F5"))
+    painter.setBrush(QColor("#E9C46A"))
+    painter.drawEllipse(QPointF(photo.right() - photo.width() * 0.24,
+                                photo.top() + photo.height() * 0.24),
+                        photo.width() * 0.08, photo.width() * 0.08)
+    painter.restore()
+
+    # The envelope, with the thumb notch photo envelopes have.
+    body = QPainterPath()
+    body.addRoundedRect(QRectF(s * 0.14, s * 0.5, s * 0.72, s * 0.36), s * 0.03, s * 0.03)
+    notch = QPainterPath()
+    notch.addEllipse(QPointF(s * 0.5, s * 0.5), s * 0.075, s * 0.075)
+    envelope = body.subtracted(notch)
+    painter.fillPath(envelope, QColor("#BD9A6F"))
+    painter.setClipPath(envelope)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#8E7050"))
+    painter.drawRect(QRectF(s * 0.14, s * 0.83, s * 0.72, s * 0.03))
     painter.end()
     result = QIcon()
     for step in (16, 24, 32, 48, 64, 128, 256):

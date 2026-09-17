@@ -41,29 +41,22 @@ def pil_to_qimage(image) -> QImage:
 def placeholder(size: QSize, kind: str, caption: str = "") -> QPixmap:
     """A drawn stand-in for anything that cannot be rasterised here."""
     pixmap = QPixmap(size)
-    pixmap.fill(QColor(theme.SUNKEN))
+    pixmap.fill(QColor(theme.MAT))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.fillRect(pixmap.rect(), QColor("#151B26"))
+    painter.fillRect(pixmap.rect(), QColor(theme.RAISED))
     name = {mediatypes.KIND_VIDEO: "film", mediatypes.KIND_RAW: "camera"}.get(kind, "info")
-    glyph = icons.pixmap(name, min(40, max(12, size.height() // 2)), "#4A5468")
+    glyph = icons.pixmap(name, min(40, max(12, size.height() // 2)), theme.LINE_CONTROL)
     painter.drawPixmap((size.width() - glyph.width()) // 2,
                        (size.height() - glyph.height()) // 2 - (8 if caption else 0), glyph)
     if caption:
-        painter.setPen(QColor(theme.TEXT_CAPTION))
+        painter.setPen(QColor(theme.FAINT))
         font = painter.font()
         font.setPointSizeF(max(6.0, size.height() * 0.09))
         painter.setFont(font)
         painter.drawText(pixmap.rect().adjusted(4, 0, -4, -8),
                          Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, caption)
     painter.end()
-    return pixmap
-
-
-def pending_pixmap(size: QSize) -> QPixmap:
-    """A quiet tile shown while the real thumbnail is still being decoded."""
-    pixmap = QPixmap(size)
-    pixmap.fill(QColor("#10151E"))
     return pixmap
 
 

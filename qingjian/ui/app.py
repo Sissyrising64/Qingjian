@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, Signal
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -30,19 +30,20 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     app.setApplicationDisplayName(__display_name__)
     app.setOrganizationName(__organization__)
     app.setApplicationVersion(__version__)
-    app.setStyle("Fusion")
     app.setWindowIcon(icons.app_icon())
     _load_fonts(app)
-    app.setFont(QFont("Microsoft YaHei UI", 9))
-    app.setStyleSheet(theme.stylesheet())
+    theme.apply(app)
     return app
 
 
 def _load_fonts(app: QApplication) -> None:
     """Offscreen Qt has no system font discovery, and some Windows installs
     lack the interface font, so register a CJK-capable face explicitly."""
+    fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
     candidates = [
-        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc",
+        fonts / "msyh.ttc",
+        fonts / "msyhbd.ttc",
+        fonts / "bahnschrift.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/System/Library/Fonts/PingFang.ttc"),
     ]
@@ -184,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     if options["language"]:
         settings.language = options["language"]
     set_language(settings.language)
-    app.setStyleSheet(theme.stylesheet(settings.density))
+    theme.apply(app, settings.density)
 
     try:
         engine = Engine(appdirs.data_dir(), settings)

@@ -5,14 +5,15 @@ from pathlib import Path
 
 from collections import OrderedDict
 
-from PySide6.QtCore import (QObject, QRunnable, QSize, Qt, QThreadPool, QUrl,
+from PySide6.QtCore import (QObject, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QUrl,
                             Signal)
-from PySide6.QtGui import QImage, QImageReader, QMovie, QPixmap, QTransform
+from PySide6.QtGui import (QBrush, QColor, QImage, QImageReader, QMovie, QPainter, QPixmap,
+                           QTransform)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphicsScene,
-                               QGraphicsView, QHBoxLayout, QLabel, QPushButton, QSlider,
-                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QFrame, QGraphicsPixmapItem, QGraphicsRectItem,
+                               QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton,
+                               QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..core import imaging, mediatypes, video
 from ..core.i18n import tr
@@ -168,16 +169,49 @@ class PreviewPrefetcher(QObject):
         self._pool.waitForDone(2000)
 
 
+#: Paper border as a share of the photograph's shorter side.
+_BORDER_SHARE = 0.018
+#: The print's shadow: (spread, drop, alpha) per layer, in border widths. Kept
+#: tight: every border width of shadow that has to fit is taken off the photo.
+_SHADOW = ((0.3, 0.5, 72), (0.7, 0.9, 40), (1.1, 1.3, 18))
+
+
 class ImageSurface(QGraphicsView):
-    """Zoom with the wheel, pan by dragging, double-click to fit."""
+    """A print on the counter. Zoom with the wheel, pan by dragging, double-click to fit.
+
+    The paper border and the shadow are scene items sized from the picture, so
+    they scale with it as a real print would when it is brought closer.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
+        # Five items that move together on every flip: a spatial index is overhead.
+        self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self.setScene(self._scene)
+        # The paper border and the shadow are thin rectangles round the
+        # picture, never under it: whole rectangles under the photo got filled
+        # and blended on every flip only to be covered by the picture again.
+        colours = [QColor(0, 0, 0, alpha) for _spread, _drop, alpha in _SHADOW for _side in "lrb"]
+        colours += [QColor(theme.PAPER)] * 4
+        self._bands: list[QGraphicsRectItem] = []
+        for colour in colours:
+            band = QGraphicsRectItem()
+            band.setPen(Qt.PenStyle.NoPen)
+            band.setBrush(QBrush(colour))
+            band.setVisible(False)
+            self._scene.addItem(band)
+            self._bands.append(band)
+        #: The picture size the bands were last laid out for; most flips reuse them.
+        self._band_size = QSize()
+        self._paper_rect = QRectF()
+        #: Set when the user zooms or drags, so the next picture is fitted again.
+        self._touched = False
+        self._fitted_view = QSize()
         self._item = QGraphicsPixmapItem()
         self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._scene.addItem(self._item)
+        self._frame = QRectF()
         self._original = QPixmap()
         self._rotation = 0
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -187,7 +221,7 @@ class ImageSurface(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setStyleSheet(f"background: {theme.SUNKEN}; border: none;")
+        self.setStyleSheet(f"background: {theme.MAT}; border: none;")
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._original = pixmap
@@ -197,6 +231,10 @@ class ImageSurface(QGraphicsView):
     def clear_media(self) -> None:
         self._original = QPixmap()
         self._item.setPixmap(QPixmap())
+        for band in self._bands:
+            band.setVisible(False)
+        self._band_size = QSize()
+        self._frame = QRectF()
         self._scene.setSceneRect(0, 0, 1, 1)
 
     def _apply(self) -> None:
@@ -205,14 +243,68 @@ class ImageSurface(QGraphicsView):
             pixmap = pixmap.transformed(QTransform().rotate(self._rotation),
                                         Qt.TransformationMode.SmoothTransformation)
         self._item.setPixmap(pixmap)
-        self._scene.setSceneRect(self._item.boundingRect())
-        self.fit()
+        picture = self._item.boundingRect()
+        border = max(2.0, round(min(picture.width(), picture.height()) * _BORDER_SHARE))
+        paper = picture.adjusted(-border, -border, border, border)
+        shown = not pixmap.isNull()
+        if pixmap.size() != self._band_size:
+            self._band_size = pixmap.size()
+            self._lay_bands(picture, paper, border, shown)
+        self._paper_rect = paper
+        # Fitted to the print and its shadow, no more: the photo is what the
+        # window is for, and a margin here is the photo made smaller.
+        frame = paper.adjusted(-1.2 * border, -0.3 * border, 1.2 * border, 2.5 * border)
+        # A picture the same size as the last one lies exactly where it did.
+        # Fitting again would redraw the whole counter on every held-key flip
+        # instead of just the print.
+        refit = (frame != self._frame or self._touched
+                 or self._fitted_view != self.viewport().size())
+        if refit:
+            self._frame = frame
+            self._scene.setSceneRect(frame)
+            self.fit()
+
+    def _lay_bands(self, picture: QRectF, paper: QRectF, border: float, shown: bool) -> None:
+        rects = []
+        for spread, drop, _alpha in _SHADOW:
+            outer = paper.adjusted(-spread * border, (drop - spread) * border,
+                                   spread * border, (drop + spread) * border)
+            rects += [
+                QRectF(outer.left(), outer.top(), paper.left() - outer.left(), outer.height()),
+                QRectF(paper.right(), outer.top(), outer.right() - paper.right(), outer.height()),
+                QRectF(paper.left(), paper.bottom(), paper.width(),
+                       outer.bottom() - paper.bottom()),
+            ]
+        # The paper reaches a unit under the picture, so no hairline of counter
+        # can show between them once the print is scaled to the screen.
+        inside = picture.adjusted(1, 1, -1, -1)
+        rects += [
+            QRectF(paper.left(), paper.top(), paper.width(), inside.top() - paper.top()),
+            QRectF(paper.left(), inside.bottom(), paper.width(), paper.bottom() - inside.bottom()),
+            QRectF(paper.left(), paper.top(), inside.left() - paper.left(), paper.height()),
+            QRectF(inside.right(), paper.top(), paper.right() - inside.right(), paper.height()),
+        ]
+        for band, rect in zip(self._bands, rects):
+            band.setRect(rect)
+            band.setVisible(shown)
 
     def fit(self) -> None:
         if self._item.pixmap().isNull():
             return
         self.resetTransform()
-        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.fitInView(self._frame, Qt.AspectRatioMode.KeepAspectRatio)
+        self._fitted_view = self.viewport().size()
+        self._touched = False
+
+    def current_pixmap(self) -> QPixmap:
+        """The picture as it is shown, turned if it was turned."""
+        return self._item.pixmap()
+
+    def print_rect(self) -> QRect:
+        """Where the print, paper border included, lies in the viewport."""
+        if self._item.pixmap().isNull() or not self._bands[-1].isVisible():
+            return QRect()
+        return self.mapFromScene(self._paper_rect).boundingRect()
 
     def zoom_percent(self) -> int:
         if self._item.pixmap().isNull():
@@ -230,7 +322,12 @@ class ImageSurface(QGraphicsView):
         if self._item.pixmap().isNull():
             return
         step = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self._touched = True
         self.scale(step, step)
+
+    def mousePressEvent(self, event) -> None:       # noqa: N802 - Qt naming
+        self._touched = True                        # a drag may follow
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.fit()
@@ -240,41 +337,80 @@ class ImageSurface(QGraphicsView):
         self.fit()
 
 
+class _Slip(QFrame):
+    """A paper slip lying on the counter, with the counter's soft shadow."""
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        paper = QRectF(self.rect()).adjusted(14, 10, -14, -18)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for spread, drop, alpha in ((2, 5, 60), (6, 8, 30), (11, 11, 12)):
+            painter.setBrush(QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(paper.adjusted(-spread, drop - spread, spread, drop + spread),
+                                    3 + spread, 3 + spread)
+        painter.setBrush(QColor(theme.PAPER))
+        painter.drawRoundedRect(paper, 2, 2)
+        painter.end()
+
+
 class EmptySurface(QWidget):
+    """Nothing to show: a slip on the counter saying why, and what to do about it.
+
+    While a large file is still being read it stands in for that file instead,
+    without the folder button.
+    """
+
     choose_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer = QVBoxLayout(self)
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.slip = _Slip()
+        self.slip.setMinimumWidth(460)
+        self.slip.setMaximumWidth(560)
+        layout = QVBoxLayout(self.slip)
+        layout.setContentsMargins(46, 36, 46, 44)
         layout.setSpacing(10)
         glyph = QLabel()
-        glyph.setPixmap(icons.pixmap("folder", 56, "#6651D4", 1.6))
-        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title = QLabel(tr("header.no_folder"))
-        self.title.setObjectName("emptyTitle")
-        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hint = QLabel(tr("scan.hint_adjust"))
-        self.hint.setObjectName("emptyText")
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        glyph.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.glyph = glyph
+        self.title = QLabel(tr("header.no_folder"))
+        self.title.setObjectName("slipTitle")
+        self.title.setWordWrap(True)
+        self.hint = QLabel(tr("scan.hint_adjust"))
+        self.hint.setObjectName("slipText")
+        self.hint.setWordWrap(True)
         self.button = QPushButton(tr("header.choose_folder"))
-        self.button.setObjectName("primaryButton")
+        self.button.setObjectName("inkButton")
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setIcon(icons.icon("folder", 15, theme.PAPER))
         self.button.clicked.connect(self.choose_requested)
+        self.keys = QLabel(tr("side.keyhint"))
+        self.keys.setObjectName("slipHint")
+        self.keys.setWordWrap(True)
         layout.addWidget(glyph)
         layout.addWidget(self.title)
         layout.addWidget(self.hint)
-        layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(8)
+        layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addSpacing(6)
+        layout.addWidget(self.keys)
+        outer.addWidget(self.slip)
+        self.set_busy(False)
 
     def set_busy(self, busy: bool) -> None:
         """Hide the folder button while this stands in for a file that is opening."""
         self.button.setVisible(not busy)
-        self.glyph.setPixmap(
-            icons.pixmap("camera" if busy else "folder", 56, "#6651D4", 1.6))
+        self.keys.setVisible(not busy)
+        self.glyph.setPixmap(icons.pixmap("camera" if busy else "folder", 30, theme.INK_SOFT, 1.6))
 
     def retranslate(self, title: str = "", hint: str = "") -> None:
         self.title.setText(title or tr("header.no_folder"))
         self.hint.setText(hint or tr("scan.hint_adjust"))
+        self.button.setText(tr("header.choose_folder"))
+        self.keys.setText(tr("side.keyhint"))
 
 
 class MediaPreview(QWidget):
@@ -303,7 +439,7 @@ class MediaPreview(QWidget):
         self.image = ImageSurface()
         self.animated = QLabel()
         self.animated.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.animated.setStyleSheet(f"background: {theme.SUNKEN};")
+        self.animated.setStyleSheet(f"background: {theme.MAT};")
 
         self.video_page = QWidget()
         video_layout = QVBoxLayout(self.video_page)
@@ -353,7 +489,7 @@ class MediaPreview(QWidget):
         def round_button(name: str, tip: str) -> QToolButton:
             button = QToolButton()
             button.setObjectName("roundButton")
-            button.setIcon(icons.icon(name, 14, theme.TEXT))
+            button.setIcon(icons.icon(name, 14, theme.PAPER_DIM))
             button.setIconSize(QSize(14, 14))
             button.setToolTip(tip)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -512,7 +648,8 @@ class MediaPreview(QWidget):
         self._muted = not self._muted
         if self.audio is not None:
             self.audio.setMuted(self._muted)
-        self.mute_button.setIcon(icons.icon("mute" if self._muted else "volume", 14, theme.TEXT))
+        self.mute_button.setIcon(icons.icon("mute" if self._muted else "volume", 14,
+                                            theme.PAPER_DIM))
 
     def step_frame(self, direction: int) -> str:
         """Show the neighbouring frame by its real timestamp. Returns a status line."""
@@ -546,7 +683,8 @@ class MediaPreview(QWidget):
 
     def _state_changed(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self.play_button.setIcon(icons.icon("pause" if playing else "play", 14, theme.TEXT))
+        self.play_button.setIcon(icons.icon("pause" if playing else "play", 14,
+                                            theme.PAPER_DIM))
         if playing:
             self._frame_time = None
 

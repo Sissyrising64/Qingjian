@@ -155,6 +155,22 @@ def hide(path: str | Path) -> None:
         pass
 
 
+def animations_enabled() -> bool:
+    """Whether the user left Windows' "Show animations" on. True elsewhere."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        value = wintypes.BOOL(True)
+        # SPI_GETCLIENTAREAANIMATION
+        if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(value), 0):
+            return bool(value.value)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return True
+
+
 def nearest_existing(path: str | Path) -> Path:
     """Walk up from *path* until something exists. Used before a target is made."""
     current = Path(path).absolute()

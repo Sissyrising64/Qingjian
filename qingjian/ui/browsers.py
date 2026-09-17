@@ -10,21 +10,24 @@ tens of thousands of files usable:
 * **The filmstrip holds a window around the cursor**, not the whole queue; it is
   a way to glance at neighbours, and nobody scrubs through 20 000 of them.
 
-Badges (raw, duration, rating, colour label) are painted into the thumbnail
-rather than drawn by a custom item delegate: fewer moving parts, and the same
-composited image serves both views.
+Badges (raw, duration, rating, colour label) are painted into the thumbnail, so
+the same composited image serves both views. The delegate only lays each
+thumbnail out as a small print: a paper border that hugs the picture whatever
+its shape, and a grease-pencil box around the frames that are chosen.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtWidgets import (QAbstractItemView, QListWidget, QListWidgetItem, QStyle,
+                               QStyledItemDelegate)
 
 from ..core import mediatypes, metadata, viewport
 from . import theme
-from .thumbs import ThumbnailCache, pending_pixmap
+from .thumbs import ThumbnailCache
 
 _ROLE_PATH = int(Qt.ItemDataRole.UserRole) + 1
 
@@ -36,9 +39,21 @@ _MAX_PROBE = 400
 FILMSTRIP_WINDOW = 80
 
 
+def _star(painter: QPainter, centre: QPointF, radius: float) -> None:
+    points = [(12, 2.4), (14.6, 8.6), (21.2, 9.2), (16.2, 13.6), (17.6, 20.2),
+              (12, 16.8), (6.4, 20.2), (7.8, 13.6), (2.8, 9.2), (9.4, 8.6)]
+    scale = radius / 10.0
+    path = QPainterPath(QPointF(centre.x() + (points[0][0] - 12) * scale,
+                                centre.y() + (points[0][1] - 12) * scale))
+    for x, y in points[1:]:
+        path.lineTo(QPointF(centre.x() + (x - 12) * scale, centre.y() + (y - 12) * scale))
+    path.closeSubpath()
+    painter.drawPath(path)
+
+
 def decorate(pixmap: QPixmap, raw: bool = False, duration: str = "", rating: int = 0,
              label: str = "", burst: str = "", keeper: bool = False) -> QPixmap:
-    """Paint the small status badges onto a copy of *pixmap*."""
+    """Paint the small status marks onto a copy of *pixmap*."""
     if pixmap.isNull():
         return pixmap
     if not (raw or duration or rating or label or burst or keeper):
@@ -47,44 +62,170 @@ def decorate(pixmap: QPixmap, raw: bool = False, duration: str = "", rating: int
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     width, height = canvas.width(), canvas.height()
-    font = painter.font()
-    font.setPointSizeF(max(5.5, height * 0.085))
-    font.setBold(True)
-    painter.setFont(font)
+    painter.setFont(theme.numeral_font(max(8, int(min(width, height) * 0.1))))
     metrics = painter.fontMetrics()
-    pad = max(2, int(height * 0.03))
+    pad = max(2, int(min(width, height) * 0.04))
+    chip_height = metrics.height() + 2
 
-    def chip(text: str, x: int, y: int, fill: str, ink: str, right: bool = False) -> None:
-        box_width = metrics.horizontalAdvance(text) + 8
-        box_height = metrics.height() + 2
+    def chip(text: str, x: float, y: float, fill: QColor, ink: str, right: bool = False,
+             extra: float = 0.0) -> float:
+        box_width = metrics.horizontalAdvance(text) + 8 + extra
         left = x - box_width if right else x
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(fill))
-        painter.drawRoundedRect(left, y, box_width, box_height, 3, 3)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(QRectF(left, y, box_width, chip_height), 2, 2)
         painter.setPen(QColor(ink))
-        painter.drawText(left, y, box_width, box_height, Qt.AlignmentFlag.AlignCenter, text)
+        painter.drawText(QRectF(left + extra, y, box_width - extra, chip_height),
+                         int(Qt.AlignmentFlag.AlignCenter), text)
+        return left + box_width
 
-    if raw:
-        chip("RAW", width - pad, pad, "#241E3D", theme.KEYCAP_TEXT, right=True)
-    if duration:
-        chip(duration, width - pad, height - pad - metrics.height() - 2,
-             "#0B0E14", theme.TEXT_BUTTON, right=True)
-    if burst:
-        chip(burst, pad, pad, "#2C2415", theme.WARN)
-    if keeper:
-        chip("✓", pad, pad, theme.WARN, "#201803")
-    if rating:
-        chip("★" * min(5, rating), pad, height - pad - metrics.height() - 2,
-             "#0B0E14", theme.WARN)
+    night = QColor(20, 18, 16, 190)
+    left = float(pad)
     if label:
         colour = theme.LABEL_COLOURS.get(label)
         if colour:
-            dot = max(6, int(height * 0.09))
-            painter.setPen(QColor("#0B0E14"))
+            dot = max(7.0, min(width, height) * 0.09)
+            painter.setPen(QPen(QColor(20, 18, 16, 200), 1.2))
             painter.setBrush(QColor(colour))
-            painter.drawRoundedRect(pad, int(height * 0.42), dot, dot, 2, 2)
+            painter.drawEllipse(QPointF(left + dot / 2 + 1, pad + dot / 2 + 1), dot / 2, dot / 2)
+            left += dot + pad + 2
+    if keeper:
+        end = chip("", left, pad, QColor(theme.PAPER), theme.INK, extra=chip_height * 0.6)
+        tick = QPainterPath(QPointF(left + 4, pad + chip_height * 0.52))
+        tick.lineTo(QPointF(left + 4 + chip_height * 0.22, pad + chip_height * 0.74))
+        tick.lineTo(QPointF(left + 4 + chip_height * 0.6, pad + chip_height * 0.28))
+        pen = QPen(QColor(theme.INK), max(1.4, chip_height * 0.12))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(tick)
+        left = end + pad
+    if burst:
+        chip(burst, left, pad, QColor(theme.KRAFT), theme.INK)
+    if raw:
+        chip("RAW", width - pad, pad, QColor(theme.PAPER), theme.INK, right=True)
+    if duration:
+        chip(duration, width - pad, height - pad - chip_height, night, theme.PAPER, right=True)
+    if rating:
+        count = min(5, rating)
+        radius = chip_height * 0.36
+        box_width = count * radius * 2.3 + 6
+        top = height - pad - chip_height
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(night)
+        painter.drawRoundedRect(QRectF(pad, top, box_width, chip_height), 2, 2)
+        painter.setBrush(QColor(theme.PAPER))
+        for step in range(count):
+            _star(painter, QPointF(pad + 3 + radius * 1.15 + step * radius * 2.3,
+                                   top + chip_height / 2), radius)
     painter.end()
     return canvas
+
+
+_PAPER = QColor(theme.PAPER)
+_TILE = QColor(theme.RAISED)
+_DROP = QColor(0, 0, 0, 110)
+_GREASE_PEN = QPen(QColor(theme.GREASE), 2.0)
+_GREASE_PEN.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+_HOVER_PEN = QPen(QColor(theme.LINE_CONTROL), 1.0)
+_NAME = QColor(theme.FAINT)
+_NAME_CHOSEN = QColor(theme.PAPER)
+#: Height under a print for its name, including the clearance below a grease box.
+_NAME_ROOM = 27
+#: The name font and its metrics, made on first use: a font needs the application.
+_NAME_TYPE: list = []
+
+
+def _name_type() -> tuple:
+    if not _NAME_TYPE:
+        font = theme.ui_font(11)
+        _NAME_TYPE.extend((font, QFontMetrics(font)))
+    return _NAME_TYPE[0], _NAME_TYPE[1]
+
+
+#: How far a print's shadow falls below it, in pixels.
+_DROP_OFFSET = 2
+#: Tiles kept ready to draw. A few screens' worth; the thumbnails behind them
+#: stay in the thumbnail cache either way.
+_TILE_LIMIT = 600
+
+
+def print_tile(pixmap: QPixmap, fit: QSize, border: int) -> QPixmap:
+    """A thumbnail made into a small print: fitted, paper border, shadow underneath.
+
+    Composed once when the thumbnail lands, so a repaint of the strip or the
+    sheet is one pixmap per frame instead of a scale and three fills.
+    """
+    size = pixmap.size()
+    if size.width() > fit.width() or size.height() > fit.height():
+        pixmap = pixmap.scaled(fit, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        size = pixmap.size()
+    tile = QPixmap(size.width() + 2 * border, size.height() + 2 * border + _DROP_OFFSET)
+    tile.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tile)
+    paper = QRectF(0, 0, size.width() + 2 * border, size.height() + 2 * border)
+    painter.fillRect(paper.translated(0, _DROP_OFFSET), _DROP)
+    painter.fillRect(paper, _PAPER)
+    painter.drawPixmap(border, border, pixmap)
+    painter.end()
+    return tile
+
+
+class PrintDelegate(QStyledItemDelegate):
+    """Lays a small print out in its cell and marks it when it is chosen."""
+
+    def __init__(self, view: "_Browser", border: int = 3) -> None:
+        super().__init__(view)
+        self.view = view
+        self.border = border
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt naming
+        grid = self.view.gridSize()
+        return grid if grid.isValid() else QSize(96, 96)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        cell = option.rect
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        tile = self.view.tile(index.data(_ROLE_PATH))
+        gap = self.border + 4
+        if tile is None:
+            width, height = int(cell.width() * 0.6), int(cell.height() * 0.45)
+            frame = QRectF(cell.x() + (cell.width() - width) / 2,
+                           cell.y() + (cell.height() - (30 if text else 0) - height) / 2,
+                           width, height)
+            painter.fillRect(frame, _TILE)
+        else:
+            x = cell.x() + (cell.width() - tile.width()) // 2
+            if text:
+                # The print stands on a common floor, so every name in a row
+                # sits on one line right under its picture.
+                y = cell.bottom() - gap - _NAME_ROOM - tile.height() + _DROP_OFFSET
+            else:
+                y = cell.y() + (cell.height() - tile.height() + _DROP_OFFSET) // 2
+            painter.drawPixmap(x, y, tile)
+            frame = QRectF(x, y, tile.width(), tile.height() - _DROP_OFFSET)
+
+        state = option.state
+        selected = bool(state & QStyle.StateFlag.State_Selected)
+        if selected or state & QStyle.StateFlag.State_MouseOver:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(_GREASE_PEN if selected else _HOVER_PEN)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(frame.adjusted(-3.5, -3.5, 3.5, 3.5), 3, 3)
+            painter.restore()
+
+        if text:
+            font, metrics = _name_type()
+            painter.save()
+            painter.setFont(font)
+            painter.setPen(_NAME_CHOSEN if selected else _NAME)
+            label = metrics.elidedText(str(text), Qt.TextElideMode.ElideMiddle, cell.width() - 10)
+            painter.drawText(QRectF(cell.x() + 5, cell.bottom() - gap - _NAME_ROOM + 9,
+                                    cell.width() - 10, _NAME_ROOM - 9),
+                             int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop), label)
+            painter.restore()
 
 
 class _Browser(QListWidget):
@@ -99,7 +240,8 @@ class _Browser(QListWidget):
         self.edge = edge
         self._rows: dict[str, QListWidgetItem] = {}
         self._decorations: dict[str, dict] = {}
-        self._placeholder = pending_pixmap(QSize(edge, edge))
+        #: path -> ((thumbnail key, decoration), tile), most recently drawn last.
+        self._tiles: "OrderedDict[str, tuple]" = OrderedDict()
         self.setViewMode(QListWidget.ViewMode.IconMode)
         self.setMovement(QListWidget.Movement.Static)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -108,6 +250,8 @@ class _Browser(QListWidget):
         self.setBatchSize(200)
         self.setIconSize(QSize(edge, edge))
         self.setFrameShape(QListWidget.Shape.NoFrame)
+        self.setMouseTracking(True)
+        self.setItemDelegate(PrintDelegate(self, 2 if edge < 120 else 3))
         self.cache.ready.connect(self._thumbnail_ready)
         self.cache.dropped.connect(self._thumbnail_dropped)
         self.itemActivated.connect(self._activated)
@@ -130,12 +274,10 @@ class _Browser(QListWidget):
             self.clear()
             self._rows.clear()
             self._decorations = dict(decorations or {})
-            blank = QIcon(self._placeholder)
             for path in paths:
                 item = QListWidgetItem()
                 item.setData(_ROLE_PATH, str(path))
                 item.setToolTip(str(path))
-                item.setIcon(blank)
                 self._label(item, Path(path))
                 self.addItem(item)
                 self._rows[str(path)] = item
@@ -157,7 +299,6 @@ class _Browser(QListWidget):
         self.clear()
         self._rows.clear()
         self._decorations = dict(decorations or {})
-        blank = QIcon(self._placeholder)
         finished = True
         try:
             for start in range(0, len(paths), chunk):
@@ -169,7 +310,6 @@ class _Browser(QListWidget):
                     item = QListWidgetItem()
                     item.setData(_ROLE_PATH, str(path))
                     item.setToolTip(str(path))
-                    item.setIcon(blank)
                     self._label(item, Path(path))
                     self.addItem(item)
                     self._rows[str(path)] = item
@@ -209,7 +349,6 @@ class _Browser(QListWidget):
         item = QListWidgetItem()
         item.setData(_ROLE_PATH, key)
         item.setToolTip(key)
-        item.setIcon(QIcon(self._placeholder))
         self._label(item, Path(key))
         self.blockSignals(True)
         self.insertItem(max(0, min(row, self.count())), item)
@@ -275,8 +414,25 @@ class _Browser(QListWidget):
 
     def _apply_icon(self, key: str, pixmap: QPixmap) -> None:
         item = self._rows.get(key)
-        if item is not None:
-            item.setIcon(QIcon(self._decorated(key, pixmap)))
+        if item is None:
+            return
+        decoration = self._decorations.get(key)
+        known = self._tiles.get(key)
+        signature = (pixmap.cacheKey(), repr(decoration))
+        if known is None or known[0] != signature:
+            tile = print_tile(self._decorated(key, pixmap), self.iconSize(),
+                              self.itemDelegate().border)
+            self._tiles[key] = (signature, tile)
+            while len(self._tiles) > _TILE_LIMIT:
+                self._tiles.popitem(last=False)
+        else:
+            self._tiles.move_to_end(key)
+        # The delegate draws from the tile, so this row has to be drawn again.
+        self.update(self.indexFromItem(item))
+
+    def tile(self, key) -> QPixmap | None:
+        entry = self._tiles.get(str(key)) if key is not None else None
+        return entry[1] if entry is not None else None
 
     def _decorated(self, key: str, pixmap: QPixmap) -> QPixmap:
         extra = self._decorations.get(key)
@@ -332,7 +488,7 @@ class _Browser(QListWidget):
         if edge == self.edge:
             return
         self.edge = edge
-        self._placeholder = pending_pixmap(QSize(edge, edge))
+        self._tiles.clear()
         self.setIconSize(QSize(edge, edge))
         keys = self.paths()
         selected = self.selected_paths()
@@ -354,17 +510,19 @@ class Filmstrip(_Browser):
     """A window of neighbours under the preview, for jumping about by eye."""
 
     def __init__(self, cache: ThumbnailCache, parent=None) -> None:
-        super().__init__(cache, 84, parent)
+        super().__init__(cache, 72, parent)
         self.setObjectName("filmstrip")
         self.setFlow(QListWidget.Flow.LeftToRight)
         self.setWrapping(False)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.setFixedHeight(104)
-        self.setSpacing(2)
-        self.setGridSize(QSize(96, 82))
-        self.setIconSize(QSize(84, 64))
+        # The icon box fits inside the delegate's room exactly, so a thumbnail
+        # is drawn at its own size and never rescaled on a repaint.
+        self.setFixedHeight(76)
+        self.setSpacing(0)
+        self.setGridSize(QSize(84, 66))
+        self.setIconSize(QSize(72, 54))
         self._all: list[str] = []
         self._window = (0, 0)
 
@@ -456,8 +614,18 @@ class ThumbnailGrid(_Browser):
         self._sync_grid()
 
     def _sync_grid(self) -> None:
-        label = 22 if self.show_names else 0
-        self.setGridSize(QSize(self.edge + 18, self.edge + 18 + label))
+        """Share the width out between the columns, so no empty column is left over."""
+        label = 30 if self.show_names else 0
+        base = self.edge + 18
+        available = max(base, self.viewport().width() - 1)
+        columns = max(1, available // base)
+        grid = QSize(available // columns, base + label)
+        if grid != self.gridSize():
+            self.setGridSize(grid)
+
+    def resizeEvent(self, event) -> None:            # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._sync_grid()
 
     def _label(self, item: QListWidgetItem, path: Path) -> None:
         item.setText(path.name if self.show_names else "")

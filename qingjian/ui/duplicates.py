@@ -35,9 +35,9 @@ _ROLE_INDEX = int(Qt.ItemDataRole.UserRole) + 1
 _CHUNK = 300
 
 _MARK_STYLE = {
-    "keep": (theme.REVIEW_FILL, theme.REVIEW_LINE, theme.REVIEW),
-    "extra": ("#2E1E22", "#57323A", theme.ERROR),
-    "lower": ("#2C2415", "#544427", theme.WARN),
+    "keep": (theme.RAISED, theme.LINE_CONTROL, theme.BALLPOINT_LIGHT),
+    "extra": ("#3A201C", "#6B2F28", theme.GREASE),
+    "lower": ("#3A2E1C", "#6B5530", theme.AMBER),
 }
 
 _COLUMN_WIDTHS = (260, 380, 120, 100, 80, 120)
@@ -163,6 +163,8 @@ class DuplicatesDialog(QDialog):
         for column, width in enumerate(_COLUMN_WIDTHS):
             self.table.setColumnWidth(column, width)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.currentCellChanged.connect(lambda row, *_: self._show(row))
         self.table.cellDoubleClicked.connect(lambda row, *_: self._enlarge(row))
         splitter.addWidget(self.table)
@@ -179,10 +181,8 @@ class DuplicatesDialog(QDialog):
         self.detail.setWordWrap(True)
         right_layout.addWidget(self.detail)
         note = QLabel(tr("dup.ignore_note"))
-        note.setObjectName("caption")
+        note.setObjectName("note")
         note.setWordWrap(True)
-        note.setStyleSheet("QLabel { background: #121823; border: 1px solid #242C3B;"
-                           " border-radius: 10px; padding: 10px 12px; }")
         right_layout.addWidget(note)
         splitter.addWidget(right)
         splitter.setSizes([720, 640])
@@ -367,7 +367,7 @@ class DuplicatesDialog(QDialog):
     def _write_row(self, row: int, group_index: int, member_index: int,
                    member: dedupe.Candidate) -> None:
         group = self.groups[group_index]
-        tint = QColor("#141C29" if group_index % 2 == 0 else "#1A2433")
+        tint = QColor("#1F1B18" if group_index % 2 == 0 else "#29241F")
         mark = "keep" if member_index == group.keeper else "extra"
         if member_index != group.keeper and member.pixels and \
                 member.pixels < group.keep().pixels:
@@ -384,7 +384,7 @@ class DuplicatesDialog(QDialog):
             item = QTableWidgetItem(str(value))
             item.setToolTip(str(member.path))
             item.setBackground(tint)
-            item.setForeground(QColor("#E8EDF5"))
+            item.setForeground(QColor(theme.PAPER))
             if column == 5:
                 item.setForeground(QColor(_MARK_STYLE[mark][2]))
             self.table.setItem(row, column, item)

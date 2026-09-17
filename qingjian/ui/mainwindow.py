@@ -10,12 +10,13 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject,
+                            QPropertyAnimation, QRect, QSize, Qt, QTimer, Signal)
+from PySide6.QtGui import QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
                                QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog,
-                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+                               QPushButton, QSizePolicy, QStackedWidget, QToolButton,
                                QVBoxLayout, QWidget)
 
 from .. import __display_name__
@@ -34,8 +35,9 @@ from .duplicates import DuplicatesDialog
 from .editors import BindingsDialog, SettingsDialog
 from .preview import MediaPreview, PreviewPrefetcher
 from .thumbs import ThumbnailCache
-from .widgets import (BindingCard, LabelSwatches, Segmented, StarRating, caption, elide,
-                      icon_button, separator, text_button)
+from .widgets import (BindingCard, CountLabel, ElidedLabel, FlyingPrint, FolderSlip,
+                      LabelSwatches, Segmented, StarRating, elide, icon_button, separator,
+                      text_button)
 
 log = get_logger("window")
 
@@ -45,6 +47,9 @@ HOLD_EDGE = 480
 #: A held key normally ends with its release. This catches a release that went
 #: to another window, so the preview never stays on a soft stand-in.
 SETTLE_MS = 500
+#: How long a filed print takes to drop into its envelope. The next print is
+#: already on the counter when it starts, so this never slows sorting down.
+BAG_MS = 180
 
 
 class _ArrowKeys(QObject):
@@ -94,6 +99,13 @@ class MainWindow(QMainWindow):
         self._fixed_shortcuts: list[QShortcut] = []
         self._retranslators: list = []
         self._inflight: dict[str, tuple[Path, int]] = {}
+        #: The copy that drops into an envelope, its animation and where it lands.
+        #: Made once: a widget created per key press is polished against the
+        #: whole stylesheet every time.
+        self._flyer: FlyingPrint | None = None
+        self._fall: QPropertyAnimation | None = None
+        self._landing: BindingCard | None = None
+        self._motion = platform_.animations_enabled()
         # The grid holds one row per file, so it is filled the first time it is
         # actually shown rather than every time the queue changes.
         self._grid_dirty = True
@@ -134,21 +146,33 @@ class MainWindow(QMainWindow):
 
     # ================================================================ build
     def _build(self) -> None:
+        """The counter, top to bottom.
+
+        Its edge (folder, view and tools); the stage with the print on it, the
+        backprint line and the index strip; the ten envelopes; the status line.
+        Every row outside the stage is kept to what it needs, because the print
+        is what the window is for.
+        """
         root = QWidget()
         root.setObjectName("root")
+        # The counter itself takes focus at start, so no control opens with a
+        # focus ring on it and every key goes to the shortcuts.
+        root.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(16, 13, 16, 9)
-        outer.setSpacing(10)
+        outer.setContentsMargins(16, 8, 16, 8)
+        outer.setSpacing(0)
         outer.addLayout(self._build_header())
-        outer.addWidget(self._build_toolbar())
-
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        body.addWidget(self._build_viewer(), 1)
-        body.addWidget(self._build_sidebar())
-        outer.addLayout(body, 1)
+        outer.addSpacing(6)
+        self._build_stamps()
+        outer.addWidget(self._build_viewer(), 1)
+        outer.addSpacing(6)
+        outer.addLayout(self._build_envelopes())
+        outer.addSpacing(6)
         outer.addLayout(self._build_status())
+        # The stack opens on the single view; a saved grid preference has to
+        # be applied, or the view switch and the page shown disagree.
+        self._set_view(self.view_mode)
         # Initialise undo/redo before the first event-loop turn. Qt creates
         # buttons enabled by default, so a fresh window must not flash a
         # clickable recovery action while startup is still settling.
@@ -169,9 +193,8 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        row.setSpacing(12)
-        brand_box = QVBoxLayout()
-        brand_box.setSpacing(0)
+        row.setSpacing(8)
+        self._header_row = row
         brand = QLabel(__display_name__)
         brand.setObjectName("brand")
         subtitle = QLabel(tr("app.subtitle"))
@@ -179,120 +202,150 @@ class MainWindow(QMainWindow):
         spaced = subtitle.font()
         spaced.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
         subtitle.setFont(spaced)
-        brand_box.addWidget(brand)
-        brand_box.addWidget(subtitle)
-        row.addLayout(brand_box)
-        row.addWidget(separator(length=26))
+        row.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(subtitle, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addSpacing(10)
 
-        self.source_display = QLineEdit()
-        self.source_display.setObjectName("sourceDisplay")
-        self.source_display.setReadOnly(True)
-        self.source_display.setPlaceholderText(tr("header.no_folder"))
-        row.addWidget(self.source_display, 1)
-        self.count_pill = QLabel("")
-        self.count_pill.setObjectName("counterPill")
-        row.addWidget(self.count_pill)
-
-        self.choose_button = text_button(tr("header.choose_folder"), "primaryButton", "folder",
-                                         "#FFFFFF")
+        # The folder being sorted, as a pickup slip. Clicking it picks another.
+        self.source_slip = FolderSlip()
+        self.source_slip.setMaximumWidth(560)
+        self.source_slip.clicked.connect(self.choose_folder)
+        # Spare width goes to the slip first, up to its cap, then to the gap.
+        row.addWidget(self.source_slip, 6)
+        self.choose_button = text_button(tr("header.choose_folder"), "compactButton", "folder")
         self.choose_button.clicked.connect(self.choose_folder)
         row.addWidget(self.choose_button)
-        self.rescan_button = icon_button("refresh", tr("header.rescan_tip"), 17,
-                                         "headerIconButton")
+        self.rescan_button = icon_button("refresh", tr("header.rescan_tip"), 16)
         self.rescan_button.clicked.connect(self.rescan)
         row.addWidget(self.rescan_button)
-
-        self.language_switch = Segmented(
-            [(code, name) for code, name in
-             (("zh", "中"), ("en", "EN"))], primary=True)
-        self.language_switch.set_value(get_language(), quiet=True)
-        self.language_switch.changed.connect(self._change_language)
-        row.addWidget(self.language_switch)
-
-        self.settings_button = icon_button("gear", tr("settings.title"), 17, "headerIconButton")
-        self.settings_button.clicked.connect(self.open_settings)
-        row.addWidget(self.settings_button)
-        return row
-
-    def _build_toolbar(self) -> QFrame:
-        bar = QFrame()
-        bar.setObjectName("toolsBar")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(9)
+        row.addStretch(1)
+        row.addSpacing(8)
 
         self.view_switch = Segmented()
         self.view_switch.changed.connect(self._change_view)
         row.addWidget(self.view_switch)
-        row.addWidget(separator())
-
         self.filter_combo = QComboBox()
+        self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.filter_combo.currentIndexChanged.connect(self._filter_changed)
         row.addWidget(self.filter_combo)
         self.sort_combo = QComboBox()
+        self.sort_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.sort_combo.currentIndexChanged.connect(self._sort_changed)
         row.addWidget(self.sort_combo)
-        self.reverse_button = icon_button("chevron-down", tr("sort.reverse"), 14)
+        self.reverse_button = icon_button("reverse", tr("sort.reverse"), 16)
         self.reverse_button.setCheckable(True)
         self.reverse_button.setChecked(self.settings.sort_reverse)
         self.reverse_button.toggled.connect(self._reverse_changed)
         row.addWidget(self.reverse_button)
-
         self.recursive_check = QCheckBox(tr("scan.recursive"))
         self.recursive_check.setChecked(self.settings.recursive)
         self.recursive_check.toggled.connect(self._recursive_changed)
         row.addWidget(self.recursive_check)
-        row.addStretch(1)
+        row.addSpacing(8)
 
-        self.duplicates_button = text_button(tr("tool.duplicates"), "compactButton", "duplicate")
-        self.duplicates_button.clicked.connect(self.open_duplicates)
-        self.history_button = text_button(tr("tool.history"), "compactButton", "history")
-        self.history_button.clicked.connect(self.show_history)
-        self.stats_button = text_button(tr("tool.stats"), "compactButton", "stats")
-        self.stats_button.clicked.connect(self.show_statistics)
-        self.backup_button = text_button(tr("tool.backups"), "compactButton", "shield")
-        self.backup_button.clicked.connect(self.open_backups)
-        self.recover_button = text_button(tr("tool.recover"), "compactButton", "warning")
+        self.recover_button = text_button(tr("tool.recover"), "warningButton", "warning",
+                                          theme.AMBER)
         self.recover_button.clicked.connect(self.recover_pending)
         self.recover_button.setVisible(False)
-        for widget in (self.duplicates_button, self.history_button, self.stats_button,
-                       self.backup_button, self.recover_button):
-            row.addWidget(widget)
-        return bar
+        row.addWidget(self.recover_button)
+        self.duplicates_button = text_button(tr("tool.duplicates"), "quietButton", "duplicate")
+        self.duplicates_button.clicked.connect(self.open_duplicates)
+        row.addWidget(self.duplicates_button)
+        self.more_button = QToolButton()
+        self.more_button.setObjectName("menuButton")
+        self.more_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.more_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.more_button.setIcon(icons.icon("more", 15, theme.PAPER_DIM))
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more = QMenu(self.more_button)
+        self.history_action = more.addAction(icons.icon("history", 15, theme.PAPER_DIM),
+                                             tr("tool.history"), self.show_history)
+        self.stats_action = more.addAction(icons.icon("stats", 15, theme.PAPER_DIM),
+                                           tr("tool.stats"), self.show_statistics)
+        self.backup_action = more.addAction(icons.icon("shield", 15, theme.PAPER_DIM),
+                                            tr("tool.backups"), self.open_backups)
+        self.more_button.setMenu(more)
+        row.addWidget(self.more_button)
+
+        self.language_button = text_button("", "quietButton")
+        self.language_button.clicked.connect(self._toggle_language)
+        row.addWidget(self.language_button)
+        self.settings_button = icon_button("gear", tr("settings.title"), 17)
+        self.settings_button.clicked.connect(self.open_settings)
+        row.addWidget(self.settings_button)
+        return row
+
+    def _build_stamps(self) -> None:
+        """Stars, label stickers and the review queue: what gets marked on a print.
+
+        One set, carried to whichever view is showing: under the print in the
+        single view, above the sheet in the grid, where it marks the selection.
+        """
+        self.stamps = QWidget()
+        row = QHBoxLayout(self.stamps)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self.rating = StarRating()
+        self.rating.setToolTip(f"{tr('side.rating')} · Shift + 1–5")
+        self.rating.rated.connect(self._rate_current)
+        row.addWidget(self.rating)
+        self.labels = LabelSwatches()
+        self.labels.setToolTip(f"{tr('side.colour_label')} · Alt + 1–5")
+        self.labels.labelled.connect(self._label_current)
+        row.addWidget(self.labels)
+        self.review_button = QPushButton(tr("side.review_queue", count=0))
+        self.review_button.setObjectName("reviewButton")
+        self.review_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.review_button.setToolTip("Ctrl+R")
+        self.review_button.clicked.connect(self.toggle_review)
+        row.addWidget(self.review_button)
+        self._stamps_row: QHBoxLayout | None = None
+
+    def _place_stamps(self, mode: str) -> None:
+        row, index = ((self._grid_row, self._grid_stamps_at) if mode == config.VIEW_GRID
+                      else (self._backprint_row, self._backprint_stamps_at))
+        if self._stamps_row is row:
+            return
+        if self._stamps_row is not None:
+            self._stamps_row.removeWidget(self.stamps)
+        row.insertWidget(index, self.stamps)
+        self._stamps_row = row
 
     def _build_viewer(self) -> QWidget:
         self.viewer_stack = QStackedWidget()
 
-        panel = QFrame()
-        panel.setObjectName("panel")
-        column = QVBoxLayout(panel)
+        page = QWidget()
+        column = QVBoxLayout(page)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
+        stage = QFrame()
+        stage.setObjectName("stage")
+        stage_layout = QVBoxLayout(stage)
+        stage_layout.setContentsMargins(0, 0, 0, 0)
         self.preview = MediaPreview()
         self.preview.choose_requested.connect(self.choose_folder)
         self.preview.video_error.connect(
             lambda text: self.status(tr("status.video_failed", error=text), "warning"))
-        column.addWidget(self.preview, 1)
+        stage_layout.addWidget(self.preview)
+        column.addWidget(stage, 1)
+        self.metadata_bar = self._build_metadata_bar()
+        column.addWidget(self.metadata_bar)
 
         strip_holder = QFrame()
-        strip_holder.setObjectName("filmstripBar")
         strip_layout = QHBoxLayout(strip_holder)
-        strip_layout.setContentsMargins(8, 8, 8, 8)
-        strip_layout.setSpacing(6)
+        strip_layout.setContentsMargins(0, 0, 0, 0)
+        strip_layout.setSpacing(0)
         self.filmstrip = Filmstrip(self.thumbs)
         self.filmstrip.path_selected.connect(self._filmstrip_selected)
         strip_layout.addWidget(self.filmstrip, 1)
         column.addWidget(strip_holder)
         self.filmstrip_holder = strip_holder
+        self.viewer_stack.addWidget(page)
 
-        column.addWidget(self._build_metadata_bar())
-        self.viewer_stack.addWidget(panel)
-
-        grid_panel = QFrame()
-        grid_panel.setObjectName("panel")
-        grid_layout = QVBoxLayout(grid_panel)
-        grid_layout.setContentsMargins(11, 10, 11, 11)
-        grid_layout.setSpacing(9)
+        grid_page = QWidget()
+        grid_layout = QVBoxLayout(grid_page)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(6)
         # The toolbar wires signals to the grid, so the grid must already
         # exist while the toolbar is being built.  Creating it afterwards
         # made every real MainWindow construction fail with AttributeError.
@@ -301,7 +354,7 @@ class MainWindow(QMainWindow):
         self.grid.path_activated.connect(self._grid_activated)
         self.grid.selection_changed.connect(self._grid_selection_changed)
         grid_layout.addWidget(self.grid, 1)
-        self.viewer_stack.addWidget(grid_panel)
+        self.viewer_stack.addWidget(grid_page)
         return self.viewer_stack
 
     def _build_grid_toolbar(self) -> QHBoxLayout:
@@ -320,24 +373,30 @@ class MainWindow(QMainWindow):
         self._grid_size_timer.timeout.connect(self._apply_grid_size)
         self.grid_size.valueChanged.connect(lambda _value: self._grid_size_timer.start())
         self.grid_size.sliderReleased.connect(self._apply_grid_size)
-        row.addWidget(QLabel(""))
+        size_icon = QLabel()
+        size_icon.setPixmap(icons.pixmap("grid", 15, theme.FAINT))
+        row.addWidget(size_icon)
         row.addWidget(self.grid_size)
-        row.addWidget(separator())
+        row.addSpacing(6)
         self.show_names = QCheckBox(tr("grid.show_filename"))
         self.show_names.setChecked(True)
         self.show_names.toggled.connect(self.grid.set_show_names)
         row.addWidget(self.show_names)
         row.addStretch(1)
         self.grid_selected = QLabel("")
-        self.grid_selected.setObjectName("badgeAccent")
+        self.grid_selected.setObjectName("markTag")
         self.grid_selected.setVisible(False)
         row.addWidget(self.grid_selected)
-        self.select_all_button = text_button(tr("select_all"))
+        row.addSpacing(6)
+        self._grid_row = row
+        self._grid_stamps_at = row.count()
+        row.addSpacing(6)
+        self.select_all_button = text_button(tr("select_all"), "quietButton")
         self.select_all_button.clicked.connect(
             lambda: self.grid.select_all_paths(self.engine.queue_paths))
-        self.invert_button = text_button(tr("invert_selection"))
+        self.invert_button = text_button(tr("invert_selection"), "quietButton")
         self.invert_button.clicked.connect(self.grid.invert_selection)
-        self.clear_selection_button = text_button(tr("clear_selection"))
+        self.clear_selection_button = text_button(tr("clear_selection"), "quietButton")
         self.clear_selection_button.clicked.connect(self.grid.clearSelection)
         for widget in (self.select_all_button, self.invert_button, self.clear_selection_button):
             row.addWidget(widget)
@@ -348,170 +407,120 @@ class MainWindow(QMainWindow):
         self.grid.set_edge(self.grid_size.value())
 
     def _build_metadata_bar(self) -> QFrame:
+        """The backprint line: what the print on the counter is, how it is marked, where it sits."""
         bar = QFrame()
-        bar.setObjectName("metadataBar")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(16, 9, 12, 9)
-        row.setSpacing(9)
-        texts = QVBoxLayout()
-        texts.setSpacing(2)
+        row.setContentsMargins(2, 5, 0, 3)
+        row.setSpacing(6)
         self.filename_label = QLabel("")
         self.filename_label.setObjectName("filename")
-        self.filename_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+        self.filename_label.setSizePolicy(QSizePolicy.Policy.Maximum,
                                           QSizePolicy.Policy.Preferred)
+        row.addWidget(self.filename_label)
+        row.addSpacing(6)
         self.detail_label = QLabel("")
         self.detail_label.setObjectName("fileDetail")
         self.detail_label.setSizePolicy(QSizePolicy.Policy.Ignored,
                                         QSizePolicy.Policy.Preferred)
-        texts.addWidget(self.filename_label)
-        texts.addWidget(self.detail_label)
-        row.addLayout(texts, 1)
+        row.addWidget(self.detail_label, 1)
 
         self.sidecar_badge = QLabel("")
-        self.sidecar_badge.setObjectName("badgeAccent")
+        self.sidecar_badge.setObjectName("tag")
         self.sidecar_badge.setVisible(False)
         row.addWidget(self.sidecar_badge)
+        row.addSpacing(6)
+        self._backprint_row = row
+        self._backprint_stamps_at = row.count()
+        row.addSpacing(10)
 
-        self.info_button = text_button(tr("tool.info"), "compactButton", "info")
+        self.info_button = text_button(tr("tool.info"), "quietButton", "info")
         self.info_button.clicked.connect(self.show_info)
         row.addWidget(self.info_button)
-        self.rotate_left = icon_button("undo", "", 15, "navButton")
+        self.rotate_left = icon_button("undo", tr("tool.rotate_left"), 15, "navButton")
         self.rotate_left.clicked.connect(lambda: self.preview.image.rotate_by(-90))
-        self.rotate_right = icon_button("redo", "", 15, "navButton")
+        self.rotate_right = icon_button("redo", tr("tool.rotate_right"), 15, "navButton")
         self.rotate_right.clicked.connect(lambda: self.preview.image.rotate_by(90))
         row.addWidget(self.rotate_left)
         row.addWidget(self.rotate_right)
-        self.counter_label = QLabel("0 / 0")
-        self.counter_label.setObjectName("counterPill")
+        row.addSpacing(4)
+        self.counter_label = CountLabel("0 / 0", 13, theme.PAPER)
+        self.counter_label.setMinimumWidth(88)
         row.addWidget(self.counter_label)
-        self.previous_button = icon_button("chevron-left", "←", 16, "navButton")
+        self.previous_button = icon_button("chevron-left", tr("tool.previous"), 16, "navButton")
         self.previous_button.clicked.connect(lambda: self.step(-1))
-        self.next_button = icon_button("chevron-right", "→", 16, "navButton")
+        self.next_button = icon_button("chevron-right", tr("tool.next"), 16, "navButton")
         self.next_button.clicked.connect(lambda: self.step(1))
         row.addWidget(self.previous_button)
         row.addWidget(self.next_button)
         return bar
 
-    def _build_sidebar(self) -> QFrame:
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(392)
-        column = QVBoxLayout(sidebar)
-        column.setContentsMargins(14, 14, 14, 12)
-        column.setSpacing(9)
-
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-        self.side_title = QLabel(tr("side.title"))
-        self.side_title.setObjectName("sideTitle")
-        self.side_subtitle = QLabel(tr("side.subtitle"))
-        self.side_subtitle.setObjectName("sideSubtitle")
-        self.side_subtitle.setWordWrap(True)
-        titles.addWidget(self.side_title)
-        titles.addWidget(self.side_subtitle)
-        header.addLayout(titles, 1)
-        self.bindings_button = icon_button("sliders", tr("bind.title"), 15)
-        self.bindings_button.clicked.connect(self.open_bindings)
-        header.addWidget(self.bindings_button)
-        column.addLayout(header)
-
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(7)
-        self.preset_label = QLabel(tr("side.preset"))
-        preset_row.addWidget(self.preset_label)
-        self.preset_combo = QComboBox()
-        self.preset_combo.currentTextChanged.connect(self._switch_preset)
-        preset_row.addWidget(self.preset_combo, 1)
-        self.preset_menu_button = icon_button("plus", tr("side.preset_new"), 15)
-        self.preset_menu_button.clicked.connect(self._preset_menu)
-        preset_row.addWidget(self.preset_menu_button)
-        column.addLayout(preset_row)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText(tr("side.search_targets"))
-        self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self._filter_bindings)
-        self.search_edit.returnPressed.connect(self._activate_first_binding)
-        column.addWidget(self.search_edit)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        holder = QWidget()
-        self.cards_layout = QVBoxLayout(holder)
-        self.cards_layout.setContentsMargins(0, 0, 5, 0)
-        self.cards_layout.setSpacing(7)
+    def _build_envelopes(self) -> QHBoxLayout:
+        """The ten keys, as envelopes along the front edge of the counter."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        height = self._envelope_height()
         for index in range(config.BINDING_COUNT):
-            card = BindingCard(index)
+            card = BindingCard(index, motion=self._motion)
+            card.set_envelope_height(height)
             card.activated.connect(self.classify_index)
             card.folder_requested.connect(self.choose_binding_folder)
-            self.cards_layout.addWidget(card)
+            row.addWidget(card, 1)
             self._binding_cards.append(card)
-        self.cards_layout.addStretch(1)
-        scroll.setWidget(holder)
-        column.addWidget(scroll, 1)
+        return row
 
-        tag_box = QFrame()
-        tag_box.setObjectName("settingsRow")
-        tag_layout = QVBoxLayout(tag_box)
-        tag_layout.setContentsMargins(10, 9, 10, 9)
-        tag_layout.setSpacing(7)
-        rating_row = QHBoxLayout()
-        self.rating_label = caption(tr("side.rating"))
-        rating_row.addWidget(self.rating_label)
-        self.rating = StarRating()
-        self.rating.rated.connect(self._rate_current)
-        rating_row.addWidget(self.rating)
-        rating_row.addStretch(1)
-        rating_row.addWidget(caption("Shift + 1–5"))
-        tag_layout.addLayout(rating_row)
-        label_row = QHBoxLayout()
-        self.label_label = caption(tr("side.colour_label"))
-        label_row.addWidget(self.label_label)
-        self.labels = LabelSwatches()
-        self.labels.labelled.connect(self._label_current)
-        label_row.addWidget(self.labels, 1)
-        label_row.addWidget(caption("Alt + 1–5"))
-        tag_layout.addLayout(label_row)
-        column.addWidget(tag_box)
-
-        self.review_button = QPushButton(tr("side.review_queue", count=0))
-        self.review_button.setObjectName("reviewButton")
-        self.review_button.clicked.connect(self.toggle_review)
-        column.addWidget(self.review_button)
-
-        undo_row = QHBoxLayout()
-        undo_row.setSpacing(8)
-        self.undo_button = text_button(tr("side.undo"), "undoButton", "undo", theme.UNDO)
-        self.undo_button.clicked.connect(self.undo)
-        self.redo_button = text_button(tr("side.redo"), "undoButton", "redo", theme.UNDO)
-        self.redo_button.setEnabled(False)
-        self.redo_button.clicked.connect(self.redo)
-        undo_row.addWidget(self.undo_button)
-        undo_row.addWidget(self.redo_button)
-        column.addLayout(undo_row)
-
-        self.hint_label = QLabel(tr("side.keyhint"))
-        self.hint_label.setObjectName("keyboardHint")
-        self.hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(self.hint_label)
-        return sidebar
+    def _envelope_height(self) -> int:
+        return int(theme.metrics(self.settings.density)["button"] * 2.1)
 
     def _build_status(self) -> QHBoxLayout:
+        """The counter's front ledger: which set of envelopes, then how the work stands."""
         row = QHBoxLayout()
-        row.setSpacing(14)
-        row.setContentsMargins(4, 0, 4, 0)
-        self.status_label = QLabel(tr("status.ready"))
-        self.status_label.setObjectName("statusBar")
-        row.addWidget(self.status_label)
+        self._ledger_row = row
+        row.setSpacing(8)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.preset_label = QLabel(tr("side.preset"))
+        self.preset_label.setObjectName("caption")
+        row.addWidget(self.preset_label)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(110)
+        self.preset_combo.currentTextChanged.connect(self._switch_preset)
+        row.addWidget(self.preset_combo)
+        self.preset_menu_button = icon_button("plus", tr("side.preset_new"), 15)
+        self.preset_menu_button.clicked.connect(self._preset_menu)
+        row.addWidget(self.preset_menu_button)
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("search")
+        self.search_edit.setPlaceholderText(tr("side.search_targets"))
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.addAction(icons.icon("search", 14, theme.FAINT),
+                                   QLineEdit.ActionPosition.LeadingPosition)
+        self.search_edit.textChanged.connect(self._filter_bindings)
+        self.search_edit.returnPressed.connect(self._activate_first_binding)
+        row.addWidget(self.search_edit)
+        self.bindings_button = icon_button("edit", tr("bind.title"), 15)
+        self.bindings_button.clicked.connect(self.open_bindings)
+        row.addWidget(self.bindings_button)
+        self.keys_button = icon_button("keyboard", tr("side.keyhint"), 16)
+        row.addWidget(self.keys_button)
+        row.addWidget(separator(length=14))
+
+        self.status_label = ElidedLabel(tr("status.ready"), "statusBar")
+        row.addWidget(self.status_label, 1)
         # Copying or favouriting marks a file handled and hides it from every
         # later queue; this is the way back.
-        self.handled_button = text_button("", "compactButton")
+        self.handled_button = text_button("", "quietButton")
         self.handled_button.setVisible(False)
         self.handled_button.clicked.connect(self.reveal_handled)
         row.addWidget(self.handled_button)
-        row.addStretch(1)
+        self.undo_button = text_button(tr("side.undo"), "quietButton", "undo")
+        self.undo_button.setToolTip("Ctrl+Z")
+        self.undo_button.clicked.connect(self.undo)
+        self.redo_button = text_button(tr("side.redo"), "quietButton", "redo")
+        self.redo_button.setToolTip("Ctrl+Y")
+        self.redo_button.setEnabled(False)
+        self.redo_button.clicked.connect(self.redo)
+        row.addWidget(self.undo_button)
+        row.addWidget(self.redo_button)
+        row.addWidget(separator(length=14))
         self.queue_label = QLabel("")
         self.queue_label.setObjectName("statusBar")
         row.addWidget(self.queue_label)
@@ -519,16 +528,17 @@ class MainWindow(QMainWindow):
         self.progress_label.setObjectName("statusBar")
         row.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(150)
+        self.progress_bar.setFixedWidth(96)
         self.progress_bar.setTextVisible(False)
         row.addWidget(self.progress_bar)
-        row.addWidget(separator(length=14))
+        self._quota_separator = separator(length=14)
+        row.addWidget(self._quota_separator)
         self.quota_label = QLabel("")
         self.quota_label.setObjectName("statusBar")
         row.addWidget(self.quota_label)
         self.quota_bar = QProgressBar()
         self.quota_bar.setObjectName("quotaBar")
-        self.quota_bar.setFixedWidth(74)
+        self.quota_bar.setFixedWidth(56)
         self.quota_bar.setTextVisible(False)
         row.addWidget(self.quota_bar)
         return row
@@ -606,6 +616,7 @@ class MainWindow(QMainWindow):
         if self._started or self._busy:
             return
         self._started = True
+        self.centralWidget().setFocus()
         self._retranslate()
         self._refresh_presets()
         self._refresh_bindings()
@@ -650,12 +661,18 @@ class MainWindow(QMainWindow):
         self.engine.save_settings()
         self._retranslate()
 
+    def _toggle_language(self) -> None:
+        self._change_language("en" if get_language() == "zh" else "zh")
+
     def _retranslate(self) -> None:
         self.setWindowTitle(f"{__display_name__} · {tr('app.tagline')}")
-        self.source_display.setPlaceholderText(tr("header.no_folder"))
+        self._update_slip()
         self.choose_button.setText(tr("header.choose_folder"))
         self.rescan_button.setToolTip(tr("header.rescan_tip"))
         self.settings_button.setToolTip(tr("settings.title"))
+        # The button names the language it switches to.
+        self.language_button.setText("EN" if get_language() == "zh" else "中")
+        self.language_button.setToolTip(tr("header.language_tip"))
         self.view_switch.set_options(
             [(config.VIEW_SINGLE, tr("view.single")), (config.VIEW_GRID, tr("view.grid"))],
             {config.VIEW_SINGLE: "single", config.VIEW_GRID: "grid"})
@@ -683,27 +700,116 @@ class MainWindow(QMainWindow):
         self.reverse_button.setToolTip(tr("sort.reverse"))
         self.recursive_check.setText(tr("scan.recursive"))
         self.duplicates_button.setText(tr("tool.duplicates"))
-        self.history_button.setText(tr("tool.history"))
-        self.stats_button.setText(tr("tool.stats"))
-        self.backup_button.setText(tr("tool.backups"))
+        self.more_button.setText(tr("tool.more"))
+        self.history_action.setText(tr("tool.history"))
+        self.stats_action.setText(tr("tool.stats"))
+        self.backup_action.setText(tr("tool.backups"))
         self.recover_button.setText(tr("tool.recover"))
         self.info_button.setText(tr("tool.info"))
+        self.rotate_left.setToolTip(tr("tool.rotate_left"))
+        self.rotate_right.setToolTip(tr("tool.rotate_right"))
+        self.previous_button.setToolTip(tr("tool.previous"))
+        self.next_button.setToolTip(tr("tool.next"))
         self.show_names.setText(tr("grid.show_filename"))
         self.select_all_button.setText(tr("select_all"))
         self.invert_button.setText(tr("invert_selection"))
         self.clear_selection_button.setText(tr("clear_selection"))
-        self.side_title.setText(tr("side.title"))
-        self.side_subtitle.setText(tr("side.subtitle"))
+        self.rating.setToolTip(f"{tr('side.rating')} · Shift + 1–5")
+        self.labels.setToolTip(f"{tr('side.colour_label')} · Alt + 1–5")
         self.bindings_button.setToolTip(tr("bind.title"))
+        self.keys_button.setToolTip(tr("side.keyhint"))
         self.preset_label.setText(tr("side.preset"))
-        self.search_edit.setPlaceholderText(tr("side.search_targets"))
-        self.rating_label.setText(tr("side.rating"))
-        self.label_label.setText(tr("side.colour_label"))
+        self.preset_menu_button.setToolTip(tr("side.preset_new"))
         self.undo_button.setText(tr("side.undo"))
         self.redo_button.setText(tr("side.redo"))
-        self.hint_label.setText(tr("side.keyhint"))
+        self._compact_header()
         self._refresh_bindings()
         self._refresh_view()
+        self._update_quota()
+        self._update_handled()
+
+    def _compact_header(self) -> None:
+        """The header's text buttons keep their words only while the header fits with them.
+
+        Asked of the row itself, in whichever language is showing. The folder slip
+        is what gives way otherwise, and a folder name cut to three letters tells
+        nobody which folder is on the counter.
+        """
+        self._header_words(True)
+        if self._overflows(self._header_row):
+            self._header_words(False)
+        self._fit_ledger()
+
+    def _overflows(self, row: QHBoxLayout) -> bool:
+        """True when *row* cannot hold its widgets even at their smallest."""
+        # New words on a button mark only the window's layout stale; the row
+        # would otherwise answer with the minimum it worked out last time.
+        row.invalidate()
+        # The row's own geometry still has the old width while the window is
+        # being resized, so the room comes from the counter and its margins.
+        central = self.centralWidget()
+        margins = central.layout().contentsMargins()
+        room = central.width() - margins.left() - margins.right()
+        return row.minimumSize().width() > room
+
+    def _header_words(self, words: bool) -> None:
+        for button, key in ((self.choose_button, "header.choose_folder"),
+                            (self.duplicates_button, "tool.duplicates")):
+            button.setText(tr(key) if words else "")
+            button.setToolTip("" if words else tr(key))
+        self.more_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon if words
+            else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.more_button.setToolTip("" if words else tr("tool.more"))
+        self.recursive_check.setText(tr("scan.recursive") if words else "")
+        self.recursive_check.setIcon(QIcon() if words
+                                     else icons.icon("subfolders", 15, theme.PAPER_DIM))
+        self.recursive_check.setToolTip("" if words else tr("scan.recursive"))
+        policy = (QComboBox.SizeAdjustPolicy.AdjustToContents if words
+                  else QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        for combo in (self.filter_combo, self.sort_combo):
+            combo.setMinimumContentsLength(6)
+            combo.setSizeAdjustPolicy(policy)
+
+    def _fit_ledger(self) -> None:
+        """Where the last file went outranks everything else on the status line.
+
+        The message is kept wide enough for a whole filing report. The preset
+        caption, the long search hint and the snapshot figures give way only when
+        the row cannot hold them as well, which is asked of the row itself.
+        """
+        metrics = self.status_label.fontMetrics()
+        report = tr("status.done_action", action=tr("action.move"), name="IMG_0000.JPG")
+        self.status_label.setMinimumWidth(metrics.horizontalAdvance(report))
+        self._ledger_extras(True)
+        if self._overflows(self._ledger_row):
+            self._ledger_extras(False)
+
+    def _ledger_extras(self, shown: bool) -> None:
+        self.preset_label.setVisible(shown)
+        hint = tr("side.search_targets") if shown else tr("side.search_short")
+        self.search_edit.setPlaceholderText(hint)
+        # Room for the words, the search icon and the clear button, each of those
+        # about as wide as the field is tall.
+        self.search_edit.setFixedWidth(self.search_edit.fontMetrics().horizontalAdvance(hint)
+                                       + 2 * self.search_edit.sizeHint().height())
+        # A bar with no figure beside it says nothing, so the pair goes together.
+        for widget in (self.quota_label, self.quota_bar, self._quota_separator):
+            widget.setVisible(shown)
+
+    def resizeEvent(self, event) -> None:          # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        if self._started:
+            self._compact_header()
+
+    def _update_slip(self) -> None:
+        """The pickup slip: which folder is on the counter, and how many items it holds."""
+        root = self.engine.source_root
+        count = len(self.engine.all_files) if root else 0
+        counted = tr("header.item_count", count=count)
+        self.source_slip.set_folder(str(root or ""), counted if root else "",
+                                    tr("header.no_folder"))
+        self.source_slip.setToolTip(f"{root}\n{counted}" if root else tr("header.choose_folder"))
 
     # ============================================================= folders
     def choose_folder(self) -> None:
@@ -726,8 +832,7 @@ class MainWindow(QMainWindow):
         except Cancelled:
             return
         self.preloader.clear()
-        self.source_display.setText(str(self.engine.source_root))
-        self.source_display.setToolTip(str(self.engine.source_root))
+        self._update_slip()
         self.engine.save_settings()
         if restore and self.settings.last_path:
             self.engine.go_to(self.settings.last_path)
@@ -766,7 +871,7 @@ class MainWindow(QMainWindow):
         self._after_queue_change("")
 
     def _after_queue_change(self, message: str) -> None:
-        self.count_pill.setText(tr("header.item_count", count=len(self.engine.all_files)))
+        self._update_slip()
         self._refresh_browsers()
         self._refresh_view()
         self._update_quota()
@@ -777,7 +882,10 @@ class MainWindow(QMainWindow):
     def _update_handled(self) -> None:
         count = self.engine.hidden_handled()
         self.handled_button.setText(tr("status.hidden_handled", count=count))
-        self.handled_button.setVisible(count > 0)
+        if self.handled_button.isVisibleTo(self) != (count > 0):
+            self.handled_button.setVisible(count > 0)
+            if self._started:
+                self._fit_ledger()
 
     def reveal_handled(self) -> None:
         if self._blocked() or not self.engine.source_root:
@@ -916,11 +1024,10 @@ class MainWindow(QMainWindow):
             self._refresh_view()
 
     def _grid_selection_changed(self, count: int) -> None:
-        self.grid_selected.setText(tr("grid.selected", count=count))
+        # More than one chosen means the next key files all of them.
+        self.grid_selected.setText(tr("side.bulk_subtitle", count=count) if count > 1
+                                   else tr("grid.selected", count=count))
         self.grid_selected.setVisible(bool(count))
-        self.side_subtitle.setText(
-            tr("side.bulk_subtitle", count=count) if count > 1 else tr("side.subtitle"))
-        self.side_title.setText(tr("side.bulk_title") if count > 1 else tr("side.title"))
 
     def _refresh_view(self, scroll_strip: bool = True) -> None:
         # A full render supersedes whatever a held arrow key left pending.
@@ -933,10 +1040,15 @@ class MainWindow(QMainWindow):
                        self.rotate_left, self.rotate_right):
             widget.setEnabled(path is not None)
 
+        self.metadata_bar.setVisible(path is not None)
+        self.filmstrip_holder.setVisible(total > 0)
         if path is None:
-            self.preview.show_empty(
-                tr("scan.review_empty") if self.engine.review_mode else tr("scan.no_media"),
-                tr("scan.hint_adjust"))
+            if not self.engine.source_root:
+                self.preview.show_empty(tr("header.no_folder"), tr("scan.hint_start"))
+            else:
+                self.preview.show_empty(
+                    tr("scan.review_empty") if self.engine.review_mode
+                    else tr("scan.no_media"), tr("scan.hint_adjust"))
             self.filename_label.setText("")
             self.detail_label.setText("")
             self.sidecar_badge.setVisible(False)
@@ -1051,8 +1163,9 @@ class MainWindow(QMainWindow):
     def _update_quota(self) -> None:
         used = self.engine.backup_usage()
         cap = max(1, self.settings.quota.max_bytes)
-        self.quota_label.setText(tr("status.snapshot_usage", used=human_size(used),
-                                    cap=human_size(cap)))
+        usage = tr("status.snapshot_usage", used=human_size(used), cap=human_size(cap))
+        self.quota_label.setText(usage)
+        self.quota_bar.setToolTip(usage)
         percent = min(100, int(used * 100 / cap))
         self.quota_bar.setRange(0, 100)
         self.quota_bar.setValue(percent)
@@ -1064,6 +1177,7 @@ class MainWindow(QMainWindow):
     def _set_view(self, mode: str) -> None:
         self.view_mode = mode
         self.view_switch.set_value(mode, quiet=True)
+        self._place_stamps(mode)
         self.viewer_stack.setCurrentIndex(0 if mode == config.VIEW_SINGLE else 1)
         if mode == config.VIEW_SINGLE:
             current = self.engine.current_path()
@@ -1121,7 +1235,7 @@ class MainWindow(QMainWindow):
             self._rebuild_queue()
             return
         self._apply_change(change)
-        self.count_pill.setText(tr("header.item_count", count=len(self.engine.all_files)))
+        self._update_slip()
 
     def toggle_review(self) -> None:
         if self._blocked() or not self.engine.source_root:
@@ -1203,7 +1317,9 @@ class MainWindow(QMainWindow):
         for card, binding in zip(self._binding_cards, self.settings.bindings):
             label_key, _desc, needs = config.ACTIONS.get(binding.action,
                                                          ("action.move", "", True))
-            badge_key = {"move": "action.badge.move", "copy": "action.badge.copy",
+            # Moving is what nearly every key does; a box saying so on all ten
+            # envelopes hid the ones that copy or recycle.
+            badge_key = {"copy": "action.badge.copy",
                          "favorite": "action.badge.favorite",
                          "trash": "action.badge.undoable"}.get(binding.action, "")
             folder = str(Path(binding.folder).resolve()) if binding.folder else ""
@@ -1256,7 +1372,7 @@ class MainWindow(QMainWindow):
         if change is None:
             return
         self._apply_change(change)
-        self.count_pill.setText(tr("header.item_count", count=len(self.engine.all_files)))
+        self._update_slip()
 
     def open_bindings(self) -> None:
         if self._blocked():
@@ -1299,8 +1415,96 @@ class MainWindow(QMainWindow):
             return
         if binding.action == "tag":
             return
+        flight = self._take_off() if len(targets) == 1 else None
+        filed = False
         for path in targets:
-            self._classify_one(binding, Path(path))
+            filed = self._classify_one(binding, Path(path)) or filed
+        if filed:
+            self._bag(index, flight)
+
+    def _take_off(self) -> tuple | None:
+        """The print on the counter and where it lies, before the next one replaces it."""
+        if self.view_mode != config.VIEW_SINGLE or not self._motion:
+            return None
+        if self.preview.stack.currentIndex() != MediaPreview.IMAGE:
+            return None
+        pixmap = self.preview.image.current_pixmap()
+        if pixmap.isNull():
+            return None
+        area = self.preview.image.print_rect()
+        corner = self.preview.image.viewport().mapTo(self.centralWidget(), area.topLeft())
+        return pixmap, QRect(corner, area.size())
+
+    def _bag(self, index: int, flight: tuple | None) -> None:
+        """装袋: a copy of the filed print drops into its envelope, which stamps it.
+
+        Purely a picture of what happened. It starts on the next turn of the
+        event loop, once the key press has put the next print up, so scaling
+        the copy never holds that print back.
+        """
+        card = self._binding_cards[index]
+        if flight is None or not card.isVisible():
+            card.receive()
+            return
+        QTimer.singleShot(0, lambda: self._drop(card, flight))
+
+    def _drop(self, card: BindingCard, flight: tuple) -> None:
+        pixmap, area = flight
+        if area.isEmpty() or not card.isVisible():
+            card.receive()
+            return
+        if self._flyer is None:
+            self._flyer = FlyingPrint(self.centralWidget())
+            self._fall = QPropertyAnimation(self._flyer, b"geometry", self)
+            self._fall.setDuration(BAG_MS)
+            self._fall.setEasingCurve(QEasingCurve.Type.OutExpo)
+            self._fall.valueChanged.connect(self._falling)
+            self._fall.finished.connect(self._landed)
+        if self._fall.state() == QAbstractAnimation.State.Running:
+            # A quick run of keys: the last drop lands now, so its stamp still shows.
+            self._fall.setCurrentTime(self._fall.duration())
+        # Cut down once, cheaply. The copy is first drawn at the animation's
+        # first tick, when OutExpo has it at about half size, and every later
+        # frame draws it smaller again with smoothing.
+        cut = area.size() * 0.6
+        if pixmap.width() > cut.width():
+            pixmap = pixmap.scaled(cut, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.FastTransformation)
+        self._flyer.set_pixmap(pixmap)
+        finish = QRect(0, 0, 22, max(10, int(22 * area.height() / max(1, area.width()))))
+        finish.moveCenter(card.mapTo(self.centralWidget(), card.mouth().center()))
+        self._landing = card
+        self._flyer.hide()
+        self._flyer.setGeometry(area)
+        self._fall.setStartValue(area)
+        self._fall.setEndValue(finish)
+        self._fall.start()
+
+    def _falling(self, _value) -> None:
+        """Show the copy only once it is under half size and on its way.
+
+        Its first frames would otherwise cover the next print. The animation
+        timer can already be running for an envelope's stamp, so the first tick
+        may come a millisecond after the start: time alone is not enough.
+        """
+        if self._flyer is None or self._fall is None or self._flyer.isVisible():
+            return
+        # Setting the next drop's end points on the stopped animation reports
+        # the last drop's final value; only a running drop may show the copy.
+        if self._fall.state() == QAbstractAnimation.State.Stopped:
+            return
+        progress = self._fall.easingCurve().valueForProgress(
+            self._fall.currentTime() / max(1, self._fall.duration()))
+        if progress >= 0.45:
+            self._flyer.show()
+            self._flyer.raise_()
+
+    def _landed(self) -> None:
+        if self._flyer is not None:
+            self._flyer.hide()
+        if self._landing is not None:
+            self._landing.receive()
+            self._landing = None
 
     def _targets(self) -> list[Path]:
         if self.view_mode == config.VIEW_GRID:
@@ -1310,7 +1514,8 @@ class MainWindow(QMainWindow):
         current = self.engine.current_path()
         return [current] if current is not None else []
 
-    def _classify_one(self, binding: config.Binding, path: Path) -> None:
+    def _classify_one(self, binding: config.Binding, path: Path) -> bool:
+        """File one item. True when an operation was started for it."""
         group = self.engine.group_for(path)
         rules = self.settings.sidecar
         if group.sidecars and rules.enabled and binding.action in ("move", "copy", "favorite"):
@@ -1321,7 +1526,7 @@ class MainWindow(QMainWindow):
                                        remember=rules.prompt == PROMPT_ONCE)
                 accepted = self._run_dialog(dialog) == QDialog.DialogCode.Accepted
                 if not accepted:
-                    return
+                    return False
                 chosen = set(dialog.chosen())
                 group.members = [m for m in group.members if m.path in chosen]
                 if dialog.remembered():
@@ -1340,12 +1545,12 @@ class MainWindow(QMainWindow):
                 else:
                     decision, remember = ConflictDialog.ask(self, path, target)
                     if decision == ops.CONFLICT_CANCEL:
-                        return
+                        return False
                     if remember:
                         self._conflict_default = decision
                 if decision == ops.CONFLICT_SKIP:
                     self.status(tr("skip"), "normal")
-                    return
+                    return False
         # Recycling asks nothing: Ctrl+Z brings the file straight back, and a
         # question per file turned a grid selection into a row of dialogs.
         resolver = (lambda a, b, value=decision: value) if decision else ops.always_sequence
@@ -1354,6 +1559,7 @@ class MainWindow(QMainWindow):
             lambda progress, cancel: self.engine.classify(
                 binding, path, resolver, progress, cancel, group=group),
             f"{tr(config.ACTIONS[binding.action][0])} · {path.name}")
+        return True
 
     def _blocked(self) -> bool:
         """True while an operation owns the lists; the caller must not proceed.
@@ -1425,8 +1631,7 @@ class MainWindow(QMainWindow):
                 self._rebuild_queue()
             else:
                 self._apply_change(change)
-                self.count_pill.setText(
-                    tr("header.item_count", count=len(self.engine.all_files)))
+                self._update_slip()
         self._refresh_bindings()
         self._update_actions()
         self._update_quota()
@@ -1592,7 +1797,7 @@ class MainWindow(QMainWindow):
             self.status(message, "success")
             return
         self._apply_change(change)
-        self.count_pill.setText(tr("header.item_count", count=len(self.engine.all_files)))
+        self._update_slip()
         self._update_quota()
         self._update_handled()
         self.status(message, "success")
@@ -1768,8 +1973,10 @@ class MainWindow(QMainWindow):
         self.settings = updated
         self.engine.apply_settings(updated)
         set_language(updated.language)
-        self.language_switch.set_value(get_language(), quiet=True)
-        QApplication.instance().setStyleSheet(theme.stylesheet(updated.density))
+        theme.apply(QApplication.instance(), updated.density)
+        height = self._envelope_height()
+        for card in self._binding_cards:
+            card.set_envelope_height(height)
         self._retranslate()
         self._rebuild_queue()
 

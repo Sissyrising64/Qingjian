@@ -100,6 +100,10 @@ CATALOG: dict[str, tuple[str, str]] = {
         "可调整筛选条件、选择其他文件夹或按 F5 重新扫描",
         "Adjust the filter, pick another folder, or press F5 to rescan",
     ),
+    "scan.hint_start": (
+        "选择一个文件夹，或把文件夹直接拖进这个窗口",
+        "Choose a folder, or drag one straight into this window",
+    ),
 
     # ---- toolbar -------------------------------------------------------
     "tool.duplicates": ("查重", "Duplicates"),
@@ -108,11 +112,14 @@ CATALOG: dict[str, tuple[str, str]] = {
     "tool.backups": ("备份管理", "Backups"),
     "tool.recover": ("恢复未完成操作", "Finish pending operation"),
     "tool.info": ("信息", "Info"),
+    "tool.more": ("更多", "More"),
+    "tool.rotate_left": ("预览向左转（不改动文件）", "Turn the preview left (the file is not changed)"),
+    "tool.rotate_right": ("预览向右转（不改动文件）", "Turn the preview right (the file is not changed)"),
+    "tool.previous": ("上一张（←）", "Previous (←)"),
+    "tool.next": ("下一张（→）", "Next (→)"),
+    "header.language_tip": ("切换界面语言", "Switch the interface language"),
 
     # ---- sidebar -------------------------------------------------------
-    "side.title": ("快捷分类", "Quick sort"),
-    "side.subtitle": ("单键执行动作并自动进入下一项", "One key acts and advances"),
-    "side.bulk_title": ("批量分类", "Bulk sort"),
     "side.bulk_subtitle": ("动作作用于 {count} 个选中项", "Applies to {count} selected items"),
     "side.preset": ("方案", "Preset"),
     "side.preset_new": ("新建当前方案的副本", "Duplicate this preset"),
@@ -122,6 +129,7 @@ CATALOG: dict[str, tuple[str, str]] = {
     "side.preset_exists": ("请使用不同的方案名称。", "That preset name is already taken."),
     "side.preset_last": ("至少需要保留一个分类方案。", "At least one preset must remain."),
     "side.search_targets": ("搜索目标文件夹…", "Search target folders…"),
+    "side.search_short": ("搜索…", "Search…"),
     "side.review_queue": ("待复查（{count}）", "Review later ({count})"),
     "side.review_exit": ("退出待复查（{count}）", "Leave review queue ({count})"),
     "side.undo": ("撤销", "Undo"),
@@ -154,7 +162,6 @@ CATALOG: dict[str, tuple[str, str]] = {
     "action.tag": ("打标签", "Tag"),
     "action.tag.desc": ("只记评分与色标，不移动文件", "Records rating and label; moves nothing"),
 
-    "action.badge.move": ("移动", "MOVE"),
     "action.badge.copy": ("复制", "COPY"),
     "action.badge.favorite": ("收藏", "FAVORITE"),
     "action.badge.undoable": ("可撤销", "UNDOABLE"),

@@ -22,11 +22,9 @@ def _title_row(title: str, subtitle: str = "", icon_name: str = "") -> QWidget:
     row.setSpacing(12)
     if icon_name:
         badge = QLabel()
-        badge.setPixmap(icons.pixmap(icon_name, 19, theme.KEYCAP_TEXT))
-        badge.setFixedSize(38, 38)
+        badge.setPixmap(icons.pixmap(icon_name, 22, theme.PAPER_DIM))
+        badge.setFixedSize(26, 30)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet("QLabel { background: #1A1730; border: 1px solid #4B3E86;"
-                            " border-radius: 11px; }")
         row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
     texts = QVBoxLayout()
     texts.setSpacing(4)
@@ -118,11 +116,11 @@ class ConflictDialog(QDialog):
 
 
 _KIND_TEXT = {
-    KIND_MASTER: ("sidecar.kind.master", theme.SELECTED_FILL, theme.SELECTED_LINE,
-                  theme.KEYCAP_TEXT),
-    KIND_RAW: ("sidecar.kind.raw", "#1E2A38", "#2F4256", "#8FA3B8"),
-    KIND_METADATA: ("sidecar.kind.metadata", "#1B2A2E", "#2B4C52", "#86B8B0"),
-    KIND_LIVE: ("sidecar.kind.live", "#1B2A2E", "#2B4C52", "#86B8B0"),
+    KIND_MASTER: ("sidecar.kind.master", theme.PAPER, theme.PAPER, theme.INK),
+    KIND_RAW: ("sidecar.kind.raw", "transparent", theme.LINE_CONTROL, theme.PAPER_DIM),
+    KIND_METADATA: ("sidecar.kind.metadata", "transparent", theme.LINE_CONTROL,
+                    theme.PAPER_DIM),
+    KIND_LIVE: ("sidecar.kind.live", "transparent", theme.LINE_CONTROL, theme.PAPER_DIM),
 }
 
 
@@ -146,10 +144,8 @@ class SidecarDialog(QDialog):
             "sidecar"))
 
         target = QLabel(f"{tr('sidecar.target')}   {target_name}    {target_folder}")
-        target.setObjectName("mono")
+        target.setObjectName("pathBox")
         target.setWordWrap(True)
-        target.setStyleSheet(f"QLabel {{ background: {theme.INPUT}; border: 1px solid"
-                             f" {theme.LINE_COMBO}; border-radius: 9px; padding: 9px 12px; }}")
         layout.addWidget(target)
 
         for member in group.members:
@@ -168,28 +164,26 @@ class SidecarDialog(QDialog):
             size.setObjectName("caption")
             line.addWidget(size)
             key, fill, border, ink = _KIND_TEXT.get(
-                member.kind, ("sidecar.kind.other", "#1E2A38", "#2F4256", "#8FA3B8"))
+                member.kind, ("sidecar.kind.other", "transparent", theme.LINE_CONTROL,
+                              theme.PAPER_DIM))
             badge = QLabel(tr(key))
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             badge.setMinimumWidth(104)
             badge.setStyleSheet(f"QLabel {{ background: {fill}; border: 1px solid {border};"
-                                f" border-radius: 6px; padding: 2px 9px; color: {ink};"
+                                f" border-radius: 3px; padding: 2px 9px; color: {ink};"
                                 f" font-weight: 700; }}")
             line.addWidget(badge)
             highlight = member.kind == KIND_MASTER
             row.setStyleSheet(
-                f"QWidget {{ background: {theme.CARD_HOVER if highlight else theme.CARD};"
-                f" border: 1px solid {theme.SELECTED_LINE if highlight else theme.LINE_CARD};"
-                f" border-radius: 9px; }}")
+                f"QWidget {{ background: {theme.RAISED if highlight else '#211D1A'};"
+                f" border: 1px solid {theme.LINE_CONTROL if highlight else theme.LINE};"
+                f" border-radius: 4px; }}")
             layout.addWidget(row)
             self._checks.append((check, member.path))
 
         note = QLabel(tr("sidecar.atomic", count=group.count))
-        note.setObjectName("caption")
+        note.setObjectName("note")
         note.setWordWrap(True)
-        note.setStyleSheet(f"QLabel {{ background: #121823; border: 1px solid #242C3B;"
-                           f" border-radius: 10px; padding: 11px 13px; color:"
-                           f" {theme.TEXT_SECOND}; }}")
         layout.addWidget(note)
 
         self.remember = QCheckBox(tr("sidecar.remember"))
@@ -252,6 +246,8 @@ class TableDialog(QDialog):
         table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         # Measuring a column means visiting every cell in it. A history of two
         # thousand operations is twelve thousand cells, and doing that on open
         # stalled the window for seconds.
